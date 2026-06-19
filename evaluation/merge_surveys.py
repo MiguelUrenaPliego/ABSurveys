@@ -40,7 +40,6 @@ def load_images(json_path):
 def init_scenario_state(images_df: pd.DataFrame):
     df = images_df.copy()
 
-    # Ensure required columns exist EXACTLY like backend expects
     qids = [
         "start",
         "walk-preference",
@@ -62,23 +61,16 @@ def init_scenario_state(images_df: pd.DataFrame):
 # Parse AB interactions from user logs
 # =========================================================
 def extract_interactions(csv_paths):
-    interactions = []
+    frames = []
 
     for path in csv_paths:
         df = pd.read_csv(path)
+        df = df[df["type"] == "AB"]
+        frames.append(df)
 
-        for _, row in df.iterrows():
-            if row["type"] != "AB":
-                continue
+    merged = pd.concat(frames, ignore_index=True)
 
-            interactions.append({
-                "question_id": row["question_id"],
-                "img_id_A": row["img_id_A"],
-                "img_id_B": row["img_id_B"],
-                "winner": row["answer"],
-            })
-
-    return interactions
+    return merged
 
 
 # =========================================================
@@ -100,7 +92,7 @@ async def recompute():
 
     scenario_state = init_scenario_state(images_df)
 
-    interactions = extract_interactions(USER_CSVS)
+    interactions_df = extract_interactions(USER_CSVS)
 
     dummy_col = DummyCollection()
 
@@ -108,30 +100,33 @@ async def recompute():
         "uncertainty_threshold": 0.25
     }
 
-    for i, it in enumerate(interactions):
+    for i, row in interactions_df.iterrows():
 
         await trueskill_utils.update_image_state(
             scenario=SCENARIO,
-            question_id=it["question_id"],
-            img_id_A=it["img_id_A"],
-            img_id_B=it["img_id_B"],
-            winner=it["winner"],
+            question_id=row["question_id"],
+            img_id_A=row["img_id_A"],
+            img_id_B=row["img_id_B"],
+            winner=row["answer"],
             scenario_state=scenario_state,
             config=config,
-            col=dummy_col,   # prevents DB writes
+            col=dummy_col,
         )
 
         if i % 20 == 0:
-            print(f"Processed {i}/{len(interactions)} comparisons")
+            print(f"Processed {i}/{len(interactions_df)} comparisons")
 
     return scenario_state[SCENARIO]
 
 
 # =========================================================
-# EXPORT RESULT
+# EXPORT IMAGE STATE
 # =========================================================
 def export(df: pd.DataFrame):
-    df.to_csv("/home/miguel/Documents/UNI/Master/2/ProjektVerkehr/ABsurveys/user_data/Anlagenring_user_images_merged.csv", index=False)
+    df.to_csv(
+        "/home/miguel/Documents/UNI/Master/2/ProjektVerkehr/ABsurveys/user_data/Anlagenring_user_images_merged.csv",
+        index=False
+    )
 
 
 # =========================================================
@@ -139,4 +134,13 @@ def export(df: pd.DataFrame):
 # =========================================================
 if __name__ == "__main__":
     result_df = asyncio.run(recompute())
+
+    pd.concat([pd.read_csv(p) for p in USER_CSVS], ignore_index=True)\
+        .to_csv(
+            "/home/miguel/Documents/UNI/Master/2/ProjektVerkehr/ABsurveys/user_data/Anlagenring_user_data_merged.csv",
+            index=False
+        )
+
+    print("Saved merged user data CSV")
+
     export(result_df)

@@ -7,6 +7,7 @@ import maps
 
 root = "/home/miguel/Documents/UNI/Master/2/ProjektVerkehr/ABsurveys/"
 
+user_df = pd.read_csv(root + "user_data/Anlagenring_user_data_merged.csv")
 #img_df = pd.read_json(root + "user_data/image_state.json")
 img_df = pd.read_csv(root + "user_data/Anlagenring_user_images_merged.csv")
 
@@ -92,3 +93,10 @@ walk_df = walk_df[columns + ["geometry"]].rename(columns=rename_columns)
 m = maps.create_map(walk_df,column="score",m=m,layer_name="walk")
 m.save(root + "index.html")
 print(f"Saved map to {root + 'index.html'}")
+
+# --- stats ---
+unique_users = user_df["user_id"].nunique()
+total_clicks = len(user_df)
+
+print(f"Total unique user_ids: {unique_users}")
+print(f"Total clicks (rows): {total_clicks}")
