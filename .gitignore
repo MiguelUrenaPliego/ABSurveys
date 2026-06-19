@@ -131,3 +131,5 @@ frontend/node_modules/
 Thumbs.db
 
 secrets.py
+
+update_results.txt
