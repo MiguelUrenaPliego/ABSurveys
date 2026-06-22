@@ -130,6 +130,9 @@ frontend/node_modules/
 .DS_Store
 Thumbs.db
 
-secrets.py
+tokens.py
 
 update_results.txt
+last_convo.txt
+
+*/old_streetscore/
