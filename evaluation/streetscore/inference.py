@@ -1,13 +1,7 @@
 # inference.py
 # coding: utf-8
 
-"""
-Inference utilities for street perception scoring.
-
-Public API
-----------
-run(gdf, metric, model_dir, ...)  →  GeoDataFrame with score column added
-"""
+"""Inference utilities for street perception scoring with uncertainty quantification."""
 
 from __future__ import annotations
 
@@ -17,6 +11,7 @@ from pathlib import Path
 from typing import Iterable
 
 import geopandas as gpd
+import numpy as np
 import torch
 import torch.nn as nn
 from huggingface_hub import snapshot_download
@@ -29,6 +24,7 @@ from model import (
     Net,
     get_model_filename,
 )
+from uncertainty import mc_dropout_passes, get_score_confidence_explanation
 
 
 # ---------------------------------------------------------------------------
@@ -36,8 +32,7 @@ from model import (
 # ---------------------------------------------------------------------------
 
 def download_pretrained_models(model_dir: str) -> None:
-    """
-    Download the pretrained .pth files from Hugging Face into *model_dir*.
+    """Download the pretrained .pth files from Hugging Face into *model_dir*.
 
     Safe to call even when the files already exist (HF hub is idempotent).
     """
@@ -54,20 +49,17 @@ def load_model(
     model_dir: str,
     device: torch.device,
 ) -> nn.Module:
-    """
-    Load a trained perception model from *model_dir*.
+    """Load a trained perception model from *model_dir*.
 
     The file is expected at ``{model_dir}/{metric_lowercase}.pth``.
-    The .pth files saved by *train.py* store the full ``Net`` object, so we
-    register ``Net`` as a safe global before deserialisation.
 
     Args:
-        metric:    Metric name (e.g. ``"safety"``).
-        model_dir: Directory that contains the .pth files.
-        device:    Torch device to map the model to.
+        metric (str): Metric name (e.g. ``"safety"``).
+        model_dir (str): Directory containing the .pth files.
+        device (torch.device): Torch device to map the model to.
 
     Returns:
-        Loaded model in eval mode.
+        nn.Module: Loaded model in eval mode.
     """
     model_path = os.path.join(model_dir, get_model_filename(metric))
 
@@ -78,8 +70,6 @@ def load_model(
             "the model_dir / metric name."
         )
 
-    # Support .pth files saved both from this project and from the original
-    # repo (which used ``Model_01.Net``).
     import model as _model_module
     sys.modules["Model_01"] = _model_module
 
@@ -99,7 +89,7 @@ def load_model(
 
 
 # ---------------------------------------------------------------------------
-# Single-image prediction
+# Single-image prediction with multiple uncertainty models
 # ---------------------------------------------------------------------------
 
 def predict_image_score(
@@ -107,38 +97,31 @@ def predict_image_score(
     image_path: str,
     device: torch.device,
     mc_passes: int = 0,
-) -> tuple[float, float | None]:
-    """
-    Return a perception score (and optionally its uncertainty) for one image.
+) -> tuple[float, float | None, float]:
+    """Return a perception score and dual-uncertainty values for one image.
 
-    Score
-    -----
-    The score is ``softmax(logits)[1] * 10``, i.e. the probability the model
-    assigns to the image being "preferred", scaled to 0–10.
-
-    Uncertainty via MC-Dropout
-    --------------------------
-    When ``mc_passes > 1`` the model is run *mc_passes* times with dropout
-    layers kept active (``model.train()`` mode, but no gradients).  Each pass
-    produces a slightly different score because dropout randomly masks units.
-    The standard deviation of those scores is the uncertainty estimate: a
-    small value means the model is confident; a large value means the model
-    is uncertain (the score could easily be higher or lower).
-
-    When ``mc_passes <= 1`` a single deterministic forward pass is used and
-    ``None`` is returned for the uncertainty.
+    Dual-Uncertainty Framework:
+      1. Aleatoric/Entropy Uncertainty: Measures predicted distribution confidence.
+         It maps the score (0-10) back to probability p = score / 10.
+         Binary Shannon entropy = -p*log2(p) - (1-p)*log2(1-p).
+         A score of 5.0 results in 1.0 (maximal uncertainty), while scores of 0.0 or 10.0
+         yield 0.0 (maximal certainty).
+      2. Epistemic/MC-Dropout Uncertainty: Measures model parameter consistency.
+         When mc_passes > 1, the model runs multiple times with dropout active.
+         The standard deviation of those scores measures epistemic uncertainty (on the 0-10 scale).
 
     Args:
-        model:       Loaded Net in eval mode (dropout still active if mc_passes>1).
-        image_path:  Absolute path to the image file.
-        device:      Torch device.
-        mc_passes:   Number of stochastic forward passes for uncertainty
-                     estimation.  0 or 1 → deterministic, no uncertainty.
+        model (nn.Module): Loaded Net in eval mode.
+        image_path (str): Absolute path to the image file.
+        device (torch.device): Torch device.
+        mc_passes (int, optional): Number of stochastic forward passes for MC-Dropout.
+            0 or 1 disables MC-Dropout (returns None).
 
     Returns:
-        (score, uncertainty) where score ∈ [0, 10] and uncertainty is the
-        standard deviation of MC-Dropout scores (also on the 0–10 scale),
-        or None when mc_passes ≤ 1.
+        tuple[float, float | None, float]: A tuple containing:
+            - Predicted score (float, 0.0 to 10.0).
+            - Epistemic MC-dropout uncertainty (float on the 0.0-10.0 scale, or None).
+            - Aleatoric entropy uncertainty (float on the 0.0-1.0 scale).
     """
     image = Image.open(image_path)
     if image.mode != "RGB":
@@ -146,30 +129,46 @@ def predict_image_score(
 
     tensor = IMAGE_TRANSFORM(image).unsqueeze(0).to(device)
 
+    # 1. Score prediction & MC-dropout standard deviation
     if mc_passes <= 1:
-        # Deterministic single pass
+        # Deterministic single forward pass
+        model.eval()
         with torch.no_grad():
             logits = model(tensor)
             prob = torch.softmax(logits, dim=1)[0][1].item()
-        return round(prob * 10, 2), None
+        mean_score = prob * 10.0
+        mc_std = None
+    else:
+        # MC-Dropout epistemic uncertainty estimation
+        # Force dropout layers to be in training mode and have non-zero probability
+        def enable_dropout(m):
+            if m.__class__.__name__.startswith('Dropout'):
+                if hasattr(m, 'p') and m.p == 0.0:
+                    m.p = 0.1
+                m.train()
+        
+        model.eval()
+        model.apply(enable_dropout)
+        
+        mc_scores: list[float] = []
+        with torch.no_grad():
+            for _ in range(mc_passes):
+                logits = model(tensor)
+                prob = torch.softmax(logits, dim=1)[0][1].item()
+                mc_scores.append(prob * 10.0)
+                
+        model.eval()  # restore pure eval mode
+        
+        mean_score = sum(mc_scores) / len(mc_scores)
+        variance = sum((s - mean_score) ** 2 for s in mc_scores) / len(mc_scores)
+        mc_std = variance ** 0.5
 
-    # MC-Dropout: enable dropout by switching to train() mode,
-    # but disable gradient computation to keep memory/speed reasonable.
-    model.train()
-    mc_scores: list[float] = []
-    with torch.no_grad():
-        for _ in range(mc_passes):
-            logits = model(tensor)
-            prob = torch.softmax(logits, dim=1)[0][1].item()
-            mc_scores.append(prob * 10)
-    model.eval()   # restore eval mode after MC passes
+    # 2. Aleatoric / Entropy Uncertainty calculation
+    # Answer: "if model outputs score 5, how sure is it?" -> Maximum entropy = 1.0!
+    expl = get_score_confidence_explanation(mean_score)
+    entropy_unc = expl["entropy_bits"]
 
-    mean_score = sum(mc_scores) / len(mc_scores)
-    # Population std over the MC passes
-    variance = sum((s - mean_score) ** 2 for s in mc_scores) / len(mc_scores)
-    std_score = variance ** 0.5
-
-    return round(mean_score, 2), round(std_score, 3)
+    return round(mean_score, 2), (round(mc_std, 3) if mc_std is not None else None), round(entropy_unc, 4)
 
 
 # ---------------------------------------------------------------------------
@@ -185,45 +184,24 @@ def run(
     download_missing_models: bool = False,
     mc_passes: int = 0,
 ) -> gpd.GeoDataFrame:
-    """
-    Score all images in *gdf* for one or more perception metrics.
+    """Score all images in *gdf* for one or more perception metrics.
 
     Args:
-        gdf:
-            GeoDataFrame (or plain DataFrame) with at least one column
-            containing absolute image paths.
-        metrics:
-            Single metric name or list of metric names to score.
-        model_dir:
-            Directory containing the .pth model files.
-        image_column:
-            Column in *gdf* that holds the image paths.
-        device:
-            Torch device.  Defaults to CUDA if available, else CPU.
-        download_missing_models:
-            When *True* the pretrained HF models are downloaded into
-            *model_dir* before inference.  Only useful for the default
-            metrics; custom models must be present locally.
-        mc_passes:
-            Number of MC-Dropout forward passes per image for uncertainty
-            estimation.  0 or 1 → deterministic (no uncertainty column).
-            Recommended: 20–50 for a good uncertainty estimate; note that
-            this multiplies inference time by *mc_passes*.
+        gdf (gpd.GeoDataFrame): GeoDataFrame (or plain DataFrame) with absolute image paths.
+        metrics (str | Iterable[str]): Single metric name or list of metrics.
+        model_dir (str): Directory containing the trained .pth files.
+        image_column (str, optional): Name of the column with paths. Defaults to "path".
+        device (torch.device, optional): Torch device. Defaults to auto.
+        download_missing_models (bool, optional): Auto-downloads standard checkpoints if missing.
+        mc_passes (int, optional): Number of stochastic passes for MC-Dropout.
 
     Returns:
-        Copy of *gdf* with one or two extra columns per metric:
-
-        - ``{metric}``              – predicted score (float, 0–10, or None)
-        - ``uncertainty_{metric}``  – MC-Dropout std (float, 0–10 scale),
-                                      only present when ``mc_passes > 1``.
-
-        A high uncertainty value means the model was inconsistent across
-        dropout passes and the score should be treated with more caution.
+        gpd.GeoDataFrame: Copy of *gdf* with added score and uncertainty columns.
     """
     if device is None:
         device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
-    print(f"Inference device: {device}  |  mc_passes={mc_passes}")
+    print(f"Inference device: {device} | mc_passes={mc_passes}")
 
     if isinstance(metrics, str):
         metrics = [metrics]
@@ -235,8 +213,7 @@ def run(
         if non_default:
             raise ValueError(
                 f"download_missing_models=True only works for the built-in default "
-                f"metrics {DEFAULT_METRICS}.  The following metrics are custom and "
-                f"must be present locally: {non_default}"
+                f"metrics {DEFAULT_METRICS}. Custom metrics must be present locally: {non_default}"
             )
         missing = [
             m for m in metrics
@@ -251,11 +228,12 @@ def run(
     result = gdf.copy()
 
     for metric in metrics:
-        print(f"\n######### {metric} #########")
+        print(f"\n######### Scoring Metric: {metric} #########")
         model = load_model(metric=metric, model_dir=model_dir, device=device)
 
-        scores:        list[float | None] = []
-        uncertainties: list[float | None] = []
+        scores: list[float | None] = []
+        mc_uncertainties: list[float | None] = []
+        entropy_uncertainties: list[float | None] = []
 
         for img_path in tqdm(result[image_column], desc=metric):
             if (
@@ -264,23 +242,27 @@ def run(
                 or not os.path.isfile(img_path)
             ):
                 scores.append(None)
-                uncertainties.append(None)
+                mc_uncertainties.append(None)
+                entropy_uncertainties.append(None)
                 continue
 
-            score, unc = predict_image_score(
+            score, mc_unc, ent_unc = predict_image_score(
                 model=model,
                 image_path=img_path,
                 device=device,
                 mc_passes=mc_passes,
             )
             scores.append(score)
-            uncertainties.append(unc)
+            mc_uncertainties.append(mc_unc)
+            entropy_uncertainties.append(ent_unc)
 
+        # Write columns to output dataframe
         result[metric] = scores
+        result[f"entropy_{metric}"] = entropy_uncertainties
 
         if mc_passes > 1:
-            result[f"uncertainty_{metric}"] = uncertainties
+            result[f"uncertainty_mc_{metric}"] = mc_uncertainties
 
-        print(f"{metric} inference complete.")
+        print(f"Metric '{metric}' inference complete.")
 
     return result

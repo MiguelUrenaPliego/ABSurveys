@@ -1,9 +1,7 @@
 # model.py
 # coding: utf-8
 
-"""
-Model architecture and shared constants for street perception scoring.
-"""
+"""Model architecture and shared constants for street perception scoring."""
 
 from __future__ import annotations
 
@@ -12,6 +10,7 @@ import os
 import torch
 import torch.nn as nn
 from torchvision import transforms as T
+from torchvision.transforms import functional as F_t
 from torchvision.models import ViT_B_16_Weights, vit_b_16
 
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
@@ -43,9 +42,39 @@ MODEL_FILENAMES: dict[str, str] = {
 
 HF_REPO_ID: str = "Jiani11/human-perception-place-pulse"
 
+class CenterCropToSquare:
+    """Crops the input PIL Image to a square aspect ratio at the center, 
+    preserving the original dimensions of the shorter side before resizing.
+    """
+    def __call__(self, img):
+        w, h = img.size
+        if w != h:
+            min_dim = min(w, h)
+            return F_t.center_crop(img, [min_dim, min_dim])
+        return img
+
+    def __repr__(self) -> str:
+        return f"{self.__class__.__name__}()"
+
+
 IMAGE_TRANSFORM = T.Compose(
     [
+        CenterCropToSquare(),
         T.Resize((384, 384)),
+        T.ToTensor(),
+        T.Normalize(
+            mean=[0.485, 0.456, 0.406],
+            std=[0.229, 0.224, 0.225],
+        ),
+    ]
+)
+
+TRAIN_IMAGE_TRANSFORM = T.Compose(
+    [
+        CenterCropToSquare(),
+        T.RandomResizedCrop(size=(384, 384), scale=(0.9, 1.0), ratio=(0.95, 1.05)),
+        T.RandomHorizontalFlip(p=0.5),
+        T.ColorJitter(contrast=0.2, saturation=0.2),
         T.ToTensor(),
         T.Normalize(
             mean=[0.485, 0.456, 0.406],
@@ -56,8 +85,7 @@ IMAGE_TRANSFORM = T.Compose(
 
 
 def get_model_filename(metric: str) -> str:
-    """
-    Return the .pth filename for any metric (known or custom).
+    """Return the .pth filename for any metric (known or custom).
 
     Known metrics use the canonical name from MODEL_FILENAMES.
     Unknown metrics follow the convention {metric_lowercase}.pth.
@@ -74,9 +102,7 @@ def get_model_filename(metric: str) -> str:
 # ---------------------------------------------------------------------------
 
 class Net(nn.Module):
-    """
-    Vision Transformer (ViT-B/16) with a 3-layer MLP head for binary
-    perception classification.
+    """Vision Transformer (ViT-B/16) with a 3-layer MLP head for binary perception classification.
 
     Args:
         num_classes:  Number of output logits (default 2 for binary).
