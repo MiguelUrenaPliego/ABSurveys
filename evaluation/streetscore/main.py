@@ -38,34 +38,31 @@ IMG_TEST_PATHS: Union[str, list[str], int] = 100  # 100 = all, keep train intact
 
 # --- Metrics to train -------------------------------------------------------
 METRICS: list[str] = [
-    #"walk","bike","stay"
-    "bike","stay"
+    "walk","bike","stay"
 ]
 
 # question_id filter(s) applied to human_df
 QUESTION_IDS: list | str | None = [
-    #"walk-preference","bike-preference","stay-preference"
-    "bike-preference","stay-preference"
+    "walk-preference","bike-preference","stay-preference"
 ]
 
 # img_type filter(s) applied to human_df (train) and img_df (inference)
 IMG_TYPES: list | str | None = [
-    #"walk","bike","stay"
-    "bike","stay"
+    "walk","bike","stay"
 ]
 
 # scenario filter(s) applied to human_df (train) and img_df (inference)
 SCENARIOS: list | str | None = [
-    "Anlagenring",
+    "Anlagenring","Anlagenring","Anlagenring"
 ]
 
 # --- Starting checkpoints ---------------------------------------------------
 FROM_CHECKPOINTS: list[str | None] | str | None = [
-    "safety",
+    "safety","safety","safety"
 ]
 
 # --- Resume / skip behaviour ------------------------------------------------
-RESUME_TRAINING: bool = True
+RESUME_TRAINING: bool = False
 
 # --- Baseline comparison (original_{metric} column) -------------------------
 SCORE_ORIGINAL_CHECKPOINT: bool = False
@@ -79,7 +76,7 @@ VIT_WEIGHTS: bool = True
 FREEZE_VIT: bool = True
 
 # --- Training hyperparameters -----------------------------------------------
-EPOCHS: int = 20
+EPOCHS: int = 8
 BATCH_SIZE: int = 16
 LEARNING_RATE: float = 5e-5
 
@@ -91,14 +88,25 @@ LEARNING_RATE: float = 5e-5
 # ACCURACY can be:
 #   • "pair"          → Track pairwise ranking accuracy and save checkpoint on improvement
 #   • "single"        → Track single-image classification accuracy and save on improvement
-LOSS: str = "mixed"
-ACCURACY: str = "pair"
+LOSS: str = "crossentropy"
+ACCURACY: str = "single"
 
 NUM_WORKERS: int = 4
 
 # --- Early stopping ---------------------------------------------------------
-EARLY_STOPPING_PATIENCE: int = 10
-EARLY_STOPPING_MIN_DELTA: float = 0.001
+# Set either to None to disable early stopping entirely.
+# Early stopping is also automatically disabled when SAVE_LAST_EPOCH = True.
+EARLY_STOPPING_PATIENCE: int | None = None
+EARLY_STOPPING_MIN_DELTA: float | None = None
+
+# --- Checkpoint saving ------------------------------------------------------
+# When True, the .pth file is always overwritten with the model from the most
+# recent epoch, regardless of whether validation accuracy improved.
+# The history CSV still marks checkpoint=True only on genuine accuracy gains;
+# this flag only controls which weights end up on disk at the end of training.
+# Set to True when you want the freshest weights (e.g. fixed-epoch fine-tuning).
+# Set to False (default) to keep the best-accuracy checkpoint on disk.
+SAVE_LAST_EPOCH: bool = True
 
 # --- MC-Dropout uncertainty — INFERENCE --------------------------------------
 INFERENCE_MC_PASSES: int = 20
@@ -223,86 +231,6 @@ def _load_human_dataframes(paths: Union[str, list[str]]) -> pd.DataFrame:
     return result
 
 
-def _split_train_test(
-    img_labeled: pd.DataFrame,
-    img_orphaned: pd.DataFrame,
-    test_pct: Union[int, None],
-) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Split images into (train, test) using integer percentages (0–100)."""
-    from sklearn.model_selection import train_test_split
-
-    total_images = len(img_labeled) + len(img_orphaned)
-
-    if isinstance(test_pct, int) and test_pct == 100:
-        test_df = pd.concat([img_labeled, img_orphaned], ignore_index=True)
-        train_df = img_labeled.copy()
-        print(f"  test_pct=100 → test set = all {len(test_df):,} images (train kept intact: {len(train_df):,})")
-        return (
-            train_df.reset_index(drop=True),
-            test_df.reset_index(drop=True),
-        )
-
-    test_df = img_orphaned.copy()
-    train_df = img_labeled.copy()
-
-    if isinstance(test_pct, int) and test_pct > 0:
-        target_test_n = round(total_images * test_pct / 100)
-        already_in_test = len(test_df)
-        still_needed = max(0, target_test_n - already_in_test)
-
-        if still_needed > 0 and len(train_df) > 0:
-            actual_take = min(still_needed, len(train_df))
-            extra_test, train_df = train_test_split(
-                train_df,
-                test_size=actual_take,
-                random_state=42,
-            )
-            test_df = pd.concat([test_df, extra_test], ignore_index=True)
-
-        print(
-            f"  test_pct={test_pct}% → target {target_test_n:,} test images "
-            f"(orphans: {already_in_test:,} + drawn from train: "
-            f"{len(test_df) - already_in_test:,})  "
-            f"train remaining: {len(train_df):,}"
-        )
-    else:
-        if len(test_df) > 0:
-            print(f"  test_pct=0 → only orphans in test ({len(test_df):,}), train unchanged ({len(train_df):,})")
-
-    return (
-        train_df.reset_index(drop=True),
-        test_df.reset_index(drop=True),
-    )
-
-
-def _split_human_df_val(
-    human_df: pd.DataFrame,
-    train_img_ids: set[str],
-    val_pct: Union[int, None],
-) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Split metric-filtered human_df into train and val AB pairs."""
-    from sklearn.model_selection import train_test_split
-
-    eligible = human_df[
-        human_df["img_id_A"].astype(str).isin(train_img_ids)
-        & human_df["img_id_B"].astype(str).isin(train_img_ids)
-    ].copy()
-
-    excluded = len(human_df) - len(eligible)
-    if excluded > 0:
-        print(f"    ⚠️  {excluded:,} AB pair(s) reference test-set images and are excluded from train/val.")
-
-    if not (isinstance(val_pct, int) and 0 < val_pct < 100) or len(eligible) == 0:
-        return eligible.reset_index(drop=True), pd.DataFrame(columns=human_df.columns)
-
-    train_hdf, val_hdf = train_test_split(
-        eligible,
-        test_size=val_pct / 100.0,
-        random_state=42,
-    )
-    print(f"    val_pct={val_pct}% → train {len(train_hdf):,} pairs, val {len(val_hdf):,} pairs")
-    return train_hdf.reset_index(drop=True), val_hdf.reset_index(drop=True)
-
 
 def build_image_gdf(img_df: pd.DataFrame) -> gpd.GeoDataFrame:
     """Convert image DataFrame to GeoDataFrame with absolute paths."""
@@ -335,6 +263,7 @@ def build_image_gdf(img_df: pd.DataFrame) -> gpd.GeoDataFrame:
 
 def main() -> None:
     """Fine-tune street perception models with custom parameters and dual uncertainty."""
+    import dataset as _ds
     from inference import run
     from train import train
 
@@ -375,37 +304,29 @@ def main() -> None:
     img_df_combined["img_id"] = img_df_combined["img_id"].astype(str)
     print(f"  Total images across all sources: {len(img_df_combined):,}")
 
-    valid_img_ids = (
-        pd.concat([human_df_raw["img_id_A"], human_df_raw["img_id_B"]])
-        .astype(str)
-        .unique()
-        .tolist()
-    )
-    print(f"  Image IDs appearing in AB pairs: {len(valid_img_ids):,}")
-
-    mask_in_pairs = img_df_combined["img_id"].isin(valid_img_ids)
-    img_orphaned  = img_df_combined[~mask_in_pairs].reset_index(drop=True)
-    img_labeled   = img_df_combined[mask_in_pairs].reset_index(drop=True)
-
-    if len(img_orphaned) > 0:
-        print(f"\n  ⚠️  WARNING: {len(img_orphaned):,} images do NOT appear in any AB pair.")
-        print(f"      They will be placed in the test set and count toward IMG_TEST_PATHS %.")
-
-    print(f"  Labeled images (in AB pairs): {len(img_labeled):,}")
-
-    print("\n  Splitting train/test …")
-    img_train_final, img_test_final_split = _split_train_test(
-        img_labeled=img_labeled,
-        img_orphaned=img_orphaned,
+    # ── Image-level splitting via dataset.py ─────────────────────────────────
+    # All splits are performed on unique img_ids, never on pairs, to prevent
+    # data leakage.  See dataset.py for the full contract.
+    print("\n  Splitting train / val / test by img_id (image-level) …")
+    split_dfs = _ds.split_images_by_id(
+        img_df=img_df_combined,
+        human_df=human_df_raw,
+        val_pct=img_val_pct,
         test_pct=img_test_pct,
+        random_state=42,
     )
+    img_train_final = split_dfs["train"]
+    img_val_final   = split_dfs["val"]
+    img_test_final  = split_dfs["test"]
 
+    # Merge in any explicitly-provided test CSV paths
     if img_test_df is not None and len(img_test_df) > 0:
-        img_test_final = pd.concat([img_test_df, img_test_final_split], ignore_index=True)
-    else:
-        img_test_final = img_test_final_split
+        img_test_final = pd.concat([img_test_df, img_test_final], ignore_index=True)
+        img_test_final = img_test_final.drop_duplicates(subset="img_id").reset_index(drop=True)
+        split_dfs["test"] = img_test_final
 
-    print(f"  Image split: train {len(img_train_final):,}, test {len(img_test_final):,}")
+    print(f"  Image split: train {len(img_train_final):,}, "
+          f"val {len(img_val_final):,}, test {len(img_test_final):,}")
 
     train_img_id_set = set(img_train_final["img_id"].astype(str).tolist())
     img_df_raw = img_test_final if img_test_pct == 100 else img_train_final
@@ -450,41 +371,83 @@ def main() -> None:
                 f"No AB rows found for metric '{metric}' after filtering."
             )
 
-        human_df_train, human_df_val = _split_human_df_val(
+        human_df_train, human_df_val = _ds.resolve_pairs_for_val_split(
             human_df=human_df_all,
             train_img_ids=train_img_id_set,
-            val_pct=img_val_pct,
+            val_img_ids=set(img_val_final["img_id"].astype(str)),
         )
 
-        print(f"    Train AB pairs: {len(human_df_train):,}  |  Val AB pairs: {len(human_df_val):,}")
+        # ── Single-image resolution for crossentropy mode ─────────────────────
+        # For crossentropy loss the split is at the image level: a cross-split
+        # pair (one image in train, one in val) contributes its train-image row
+        # to train and its val-image row to val.  We resolve this via
+        # resolve_pairs_image_level which calls build_single_image_df and filters
+        # by img_id_set, capturing cross-split pairs correctly.
+        single_img_train_df = None
+        single_img_val_df = None
+        if LOSS == "crossentropy":
+            single_img_train_df = _ds.resolve_pairs_image_level(
+                human_df=human_df_all,
+                img_id_set=train_img_id_set,
+            )
+            val_img_id_set = set(img_val_final["img_id"].astype(str))
+            single_img_val_df = _ds.resolve_pairs_image_level(
+                human_df=human_df_all,
+                img_id_set=val_img_id_set,
+            ) if val_img_id_set else None
 
-        if len(human_df_train) == 0:
+        print(f"    Train AB pairs: {len(human_df_train):,}  |  Val AB pairs: {len(human_df_val):,}")
+        if LOSS == "crossentropy":
+            print(f"    Train single-img rows: {len(single_img_train_df) if single_img_train_df is not None else 0:,}  |  "
+                  f"Val single-img rows: {len(single_img_val_df) if single_img_val_df is not None else 0:,}")
+
+        if len(human_df_train) == 0 and (single_img_train_df is None or len(single_img_train_df) == 0):
             raise ValueError(
                 f"No AB training pairs remain for metric '{metric}' after val split."
             )
 
-        train_valid_ids = (
-            pd.concat([human_df_train["img_id_A"], human_df_train["img_id_B"]])
-            .astype(str)
-            .unique()
-            .tolist()
-        )
+        # Determine which image rows to include in training/val img_df.
+        # For crossentropy mode: all images that appear in the single-image train/val df.
+        # For pair/mixed mode: only images that appear in both-sides-in-split pairs.
+        if LOSS == "crossentropy" and single_img_train_df is not None and len(single_img_train_df) > 0:
+            train_valid_ids = single_img_train_df["img_id"].astype(str).unique().tolist()
+        else:
+            train_valid_ids = (
+                pd.concat([human_df_train["img_id_A"], human_df_train["img_id_B"]])
+                .astype(str)
+                .unique()
+                .tolist()
+            )
         img_df_train = img_train_final[
             img_train_final["img_id"].isin(train_valid_ids)
         ].reset_index(drop=True)
         print(f"    Images used for training: {len(img_df_train):,}")
 
         val_img_df_metric = None
-        if len(human_df_val) > 0:
+        if LOSS == "crossentropy" and single_img_val_df is not None and len(single_img_val_df) > 0:
+            val_valid_ids = single_img_val_df["img_id"].astype(str).unique().tolist()
+            val_img_df_metric = img_val_final[
+                img_val_final["img_id"].isin(val_valid_ids)
+            ].reset_index(drop=True)
+            if val_img_df_metric.empty:
+                val_img_df_metric = img_train_final[
+                    img_train_final["img_id"].isin(val_valid_ids)
+                ].reset_index(drop=True)
+        elif len(human_df_val) > 0:
             val_valid_ids = (
                 pd.concat([human_df_val["img_id_A"], human_df_val["img_id_B"]])
                 .astype(str)
                 .unique()
                 .tolist()
             )
-            val_img_df_metric = img_train_final[
-                img_train_final["img_id"].isin(val_valid_ids)
+            # Use val split images; fall back to train if val_pct was 0
+            val_img_df_metric = img_val_final[
+                img_val_final["img_id"].isin(val_valid_ids)
             ].reset_index(drop=True)
+            if val_img_df_metric.empty:
+                val_img_df_metric = img_train_final[
+                    img_train_final["img_id"].isin(val_valid_ids)
+                ].reset_index(drop=True)
 
         saved_path = train(
             human_df=human_df_train,
@@ -493,6 +456,8 @@ def main() -> None:
             model_folder=MODEL_FOLDER,
             val_human_df=human_df_val if len(human_df_val) > 0 else None,
             val_img_df=val_img_df_metric,
+            single_img_train_df=single_img_train_df,
+            single_img_val_df=single_img_val_df,
             from_checkpoint=from_ckpt_for_train,
             vit_weights=VIT_WEIGHTS,
             freeze_vit=FREEZE_VIT,
@@ -507,6 +472,7 @@ def main() -> None:
             # Custom Loss/Accuracy Hyperparams passed to train
             loss_hyperparam=LOSS,
             accuracy_hyperparam=ACCURACY,
+            save_last_epoch=SAVE_LAST_EPOCH,
         )
         print(f"    ✓ Saved → {saved_path}")
 
@@ -706,10 +672,16 @@ def main() -> None:
         to_keep = existing_scores[~existing_scores["img_id"].astype(str).isin(new_ids)]
         final_scores = pd.concat([to_keep, final_scores], ignore_index=True)
 
+    # ── Stamp the 'split' column ─────────────────────────────────────────────
+    # For every image we record which dataset split it came from.
+    # When test_pct=100, images from train are still labelled "test" in this
+    # column so the reader of scores.csv knows what "all images" means.
+    final_scores = _ds.assign_split_column(final_scores, split_dfs)
+
     Path(MODEL_FOLDER).mkdir(parents=True, exist_ok=True)
     final_scores.to_csv(out_csv, index=False)
 
-    display_cols = ["img_id", IMAGE_COLUMN] + [
+    display_cols = ["img_id", "split", IMAGE_COLUMN] + [
         c for c in all_score_cols if c in final_scores.columns
     ]
     display_cols = [c for c in display_cols if c in final_scores.columns]

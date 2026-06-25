@@ -2,8 +2,8 @@
 """
 main.py
 
-End-to-end pipeline to configure, load, clean, normalize, and render multi-model
-street perception data on an interactive Leaflet map. Handles both real-world CSV
+End-to-end pipeline to configure, load, clean, normalize, and render multi-model 
+street perception data on an interactive Leaflet map. Handles both real-world CSV 
 inputs and robust fallback simulation for testing without data files.
 """
 
@@ -27,37 +27,28 @@ from utils import (
 # CONFIGURATION — Edit freely to point to your survey and model datasets
 # ============================================================================
 
-# Absolute root of the project. All relative paths below are resolved against
-# this directory at runtime. The generated map.html is also saved here.
+# Define the absolute root output path for generated artifacts (map.html, etc.)
+# Fallback is current directory
 ROOT_PATH: str = "/home/miguel/Documents/UNI/Master/2/ProjektVerkehr/ABsurveys"
 
-# Image index CSV(s) — paths inside the CSV are relative to the CSV's own
-# parent directory and will be re-expressed as ROOT_PATH-relative at load time.
-# Can be a single str or a list of files (one per scenario / tile layer).
+# List of image CSV file(s) that match images with img_ids.
+# Can be a single str or a list of files.
 IMG_PATHS: Union[str, list[str]] = "images/Anlagenring/images.csv"
 
-# Human survey data — maps user clicks / A-B choices to image pairs.
+# Human survey data (CSV file mapping user clicks/choices)
 HUMAN_DF_PATHS: Union[str, list[str]] = "user_data/Anlagenring_user_data_merged.csv"
 
-# TrueSkill score outcomes derived from human surveys.
-# Expected columns: img_id, img_type, scenario,
-#   score_<question_id>, uncertainty_<question_id>, n_answers_<question_id>
+# TrueSkill score outcomes from human surveys (CSV contains score, uncertainty, n_answers columns)
 TRUESKILL_DF_PATHS: Union[str, list[str], None] = "user_data/Anlagenring_user_images_merged.csv"
 
-# StreetScore predictions from the ML model.
-# Expected columns: img_id, img_type, scenario,
-#   <metric>, entropy_<metric>, uncertainty_mc_<metric>
-# NOTE: any path columns in this file (path, abs_path, _base_dir …) are
-#       intentionally ignored — image paths always come from images.csv.
+# StreetScore predictions from ML models (CSV contains walk/bike/stay score, entropy, MC dropout columns)
 STREETSCORE_DF_PATHS: Union[str, list[str], None] = "evaluation/streetscore/models/FrankfurtAnlagenring/scores.csv"
 
-# Optional SQLite database (.swm2) with photo GPS coordinates and camera bearing.
-# When present, lat/lon/bearing are merged into the image index by filename.
+# Optional path to SWM2 database containing photo coordinates and bearing metadata
 SWM2_DATABASE_PATH: Union[str, list[str], None] = "images/Anlagenring/database.swm2"
 
-# --- Metrics mapping ---------------------------------------------------------
-# Each entry links a StreetScore column, a TrueSkill question_id, an img_type
-# filter, and an optional scenario filter.
+# --- Metrics mapping settings ------------------------------------------------
+# Define the active metrics you want to load and compare
 METRICS_MAP = [
     {
         "streetscore_metric": "walk",
@@ -79,339 +70,412 @@ METRICS_MAP = [
     }
 ]
 
-# ============================================================================
-# HELPERS
-# ============================================================================
+# SCORE NORMALIZATION METHODOLOGY has been moved to utils.py
 
-def _abs(relative_path: str) -> str:
-    """Resolve a ROOT_PATH-relative config path to an absolute path."""
-    return os.path.join(ROOT_PATH, relative_path)
-
-
-def _to_abs_list(paths: Union[str, list[str], None]) -> list[str] | None:
-    """Normalise a path or list of paths to a list of absolute paths."""
-    if paths is None:
+# Helper function to resolve configuration paths relative to ROOT_PATH
+def get_abs_path(p: Union[str, list[str], None]) -> Union[str, list[str], None]:
+    if p is None:
         return None
-    if isinstance(paths, str):
-        return [_abs(paths)]
-    return [_abs(p) for p in paths]
-
+    if isinstance(p, list):
+        return [get_abs_path(item) for item in p]
+    if os.path.isabs(p):
+        return p
+    return os.path.normpath(os.path.join(ROOT_PATH, p))
 
 # ============================================================================
 # MAIN DATA PIPELINE
 # ============================================================================
-
-def load_and_compile_perceptions() -> tuple[list[dict], int, int]:
+def load_and_compile_perceptions() -> tuple[list[dict], int, int, bool, bool]:
     """
-    Loads raw tables, merges coordinates, matches image assets, resolves and
-    scales uncertainty parameters, executes dual-distribution normalisation,
-    and returns compiled data ready for Leaflet dashboard rendering.
-
-    Image paths in the output are always relative to ROOT_PATH so that the
-    generated map.html can serve images with simple relative URLs.
+    Loads raw tables, merges coordinates, matches image assets, resolves and scales
+    uncertainty parameters, executes dual-distribution normalization, and outputs 
+    compiled data ready for Leaflet dashboard rendering.
     """
     print("[Pipeline] Starting data ingestion and cleaning...")
 
-    # Resolve all config paths to absolute so the rest of the code is
-    # independent of the working directory.
-    abs_img_paths      = _to_abs_list(IMG_PATHS)
-    abs_human_paths    = _to_abs_list(HUMAN_DF_PATHS)
-    abs_trueskill_paths = _to_abs_list(TRUESKILL_DF_PATHS)
-    abs_streetscore_paths = _to_abs_list(STREETSCORE_DF_PATHS)
+    resolved_img_paths = get_abs_path(IMG_PATHS)
+    resolved_human_paths = get_abs_path(HUMAN_DF_PATHS)
+    resolved_trueskill_paths = get_abs_path(TRUESKILL_DF_PATHS)
+    resolved_streetscore_paths = get_abs_path(STREETSCORE_DF_PATHS)
+    resolved_swm2_paths = get_abs_path(SWM2_DATABASE_PATH)
 
+    # Verification: If local files don't exist, we fallback to a beautiful, realistic 
+    # mock simulation so that the code is fully testable and runnable out-of-the-box!
     files_exist = (
-        _all_files_exist(abs_img_paths) and
-        _all_files_exist(abs_human_paths) and
-        _all_files_exist(abs_trueskill_paths) and
-        _all_files_exist(abs_streetscore_paths)
+        _all_files_exist(resolved_img_paths) and
+        _all_files_exist(resolved_human_paths) and 
+        (resolved_trueskill_paths is None or _all_files_exist(resolved_trueskill_paths)) and 
+        (resolved_streetscore_paths is None or _all_files_exist(resolved_streetscore_paths))
     )
 
     if not files_exist:
         print("[Pipeline] Data files not fully found. Activating Realistic Simulation Mode!")
-        return generate_simulation_data()
+        pts, users, clicks = generate_simulation_data()
+        return pts, users, clicks, True, True
 
-    # -------------------------------------------------------------------------
-    # 1. IMAGE INDEX — coordinates & ROOT_PATH-relative image paths
-    # -------------------------------------------------------------------------
-    # Normalise SWM2 paths to match img_paths length.
-    if SWM2_DATABASE_PATH is None:
-        swm2_abs_list = [None] * len(abs_img_paths)
-    elif isinstance(SWM2_DATABASE_PATH, str):
-        swm2_abs_list = [_abs(SWM2_DATABASE_PATH)] * len(abs_img_paths)
+    # --- IMAGE PATHS & SWM2 COORDINATES RESOLUTION ---
+    # Normalize resolved_img_paths to a list of strings
+    if isinstance(resolved_img_paths, str):
+        img_paths_list = [resolved_img_paths]
     else:
-        swm2_abs_list = [_abs(p) for p in SWM2_DATABASE_PATH]
+        img_paths_list = resolved_img_paths
 
-    # Pad with None if fewer SWM2 entries than image CSVs.
-    if len(swm2_abs_list) < len(abs_img_paths):
-        swm2_abs_list += [None] * (len(abs_img_paths) - len(swm2_abs_list))
+    # Normalize resolved_swm2_paths to a list of corresponding length
+    if resolved_swm2_paths is None:
+        swm2_paths_list = [None] * len(img_paths_list)
+    elif isinstance(resolved_swm2_paths, str):
+        swm2_paths_list = [resolved_swm2_paths] * len(img_paths_list)
+    else:
+        swm2_paths_list = resolved_swm2_paths
 
+    # Pad swm2_paths_list with None to match img_paths_list if shorter
+    if len(swm2_paths_list) < len(img_paths_list):
+        swm2_paths_list = swm2_paths_list + [None] * (len(img_paths_list) - len(swm2_paths_list))
+
+    # For each pair, load the images CSV and merge SWM2 database metadata if exists
     img_dfs = []
-    for img_csv_abs, swm2_db in zip(abs_img_paths, swm2_abs_list):
-        print(f"[Pipeline] Loading image index from: {img_csv_abs}")
-        df = pd.read_csv(img_csv_abs)
-
-        # ------------------------------------------------------------------
-        # Re-express image paths:
-        #   CSV paths  →  relative to the CSV's parent dir
-        #              →  absolute
-        #              →  relative to ROOT_PATH   (used in map.html URLs)
-        # ------------------------------------------------------------------
-        csv_dir = os.path.dirname(os.path.abspath(img_csv_abs))
-        root_abs = os.path.abspath(ROOT_PATH)
-
-        def to_root_relative(row_path: str) -> str:
+    for img_csv, swm2_db in zip(img_paths_list, swm2_paths_list):
+        print(f"[Pipeline] Loading images index from: {img_csv}")
+        df = pd.read_csv(img_csv)
+        
+        # Resolve paths to be relative to ROOT_PATH
+        csv_dir = os.path.dirname(os.path.abspath(img_csv))
+        def resolve_rel_path(row_path):
             if pd.isna(row_path):
                 return row_path
-            # path column is relative to the CSV's directory
-            full = os.path.normpath(os.path.join(csv_dir, str(row_path)))
+            full_img_path = os.path.join(csv_dir, str(row_path))
             try:
-                return os.path.relpath(full, root_abs)
-            except ValueError:
-                # On Windows, relpath can fail across drives; fall back to absolute.
-                return full
-
+                return os.path.relpath(full_img_path, os.path.abspath(ROOT_PATH))
+            except Exception:
+                return str(row_path)
+        
         if "path" in df.columns:
-            df["path"] = df["path"].apply(to_root_relative)
-
-        # ------------------------------------------------------------------
-        # Optional: merge GPS coordinates from SWM2 SQLite database.
-        # ------------------------------------------------------------------
+            df["path"] = df["path"].apply(resolve_rel_path)
+        
+        # Merge photo locations from SWM2 if it exists
         if swm2_db is not None and os.path.exists(swm2_db):
-            print(f"[Pipeline] Merging coordinates from SWM2: {swm2_db}")
+            print(f"[Pipeline] Merging photo locations from SWM2 database: {swm2_db}")
             try:
                 conn = sqlite3.connect(swm2_db)
-                db_meta = pd.read_sql_query(
-                    """
+                db_meta = pd.read_sql_query("""
                     SELECT photo_path, lon AS x, lat AS y, bearing
                     FROM photos p JOIN points pt ON p.uuid = pt.fid
-                    """,
-                    conn,
-                )
+                """, conn)
                 conn.close()
-
+                
                 db_meta["filename"] = db_meta["photo_path"].apply(os.path.basename)
                 df["filename"] = df["path"].apply(os.path.basename)
-
-                df = df.merge(
-                    db_meta[["filename", "x", "y", "bearing"]],
-                    on="filename", how="left", suffixes=("", "_db")
-                )
+                
+                df = df.merge(db_meta[["filename", "x", "y", "bearing"]], on="filename", how="left", suffixes=("", "_db"))
+                
+                # Resolve coordinates and bearing
                 for col in ["x", "y", "bearing"]:
                     db_col = f"{col}_db"
                     if db_col in df.columns:
-                        df[col] = df[db_col].combine_first(df.get(col, pd.Series(dtype=float)))
+                        df[col] = df[db_col].combine_first(df[col]) if col in df.columns else df[db_col]
                         df.drop(columns=[db_col], inplace=True)
             except Exception as e:
-                print(f"[Pipeline] SWM2 join failed for {swm2_db}: {e}")
-
+                print(f"[Pipeline] SWM2 Join failed for {swm2_db}: {e}")
+        
         img_dfs.append(df)
-
+        
     img_df = pd.concat(img_dfs, ignore_index=True)
 
-    # Normalise coordinate column names.
-    if "lon" in img_df.columns:
-        img_df.rename(columns={"lon": "x"}, inplace=True)
-    if "lat" in img_df.columns:
-        img_df.rename(columns={"lat": "y"}, inplace=True)
+    # Load human clicks (human_df)
+    if resolved_human_paths is not None:
+        print(f"[Pipeline] Loading human clicks from: {resolved_human_paths}")
+        human_df = pd.read_csv(resolved_human_paths) if isinstance(resolved_human_paths, str) else pd.concat([pd.read_csv(p) for p in resolved_human_paths])
+    else:
+        human_df = pd.DataFrame()
 
-    # Fill in fallback coordinates / bearing if the SWM2 had no data.
-    if "x" not in img_df.columns:
-        img_df["x"] = 8.6821 + np.random.normal(0, 0.002, len(img_df))
-    if "y" not in img_df.columns:
-        img_df["y"] = 50.1109 + np.random.normal(0, 0.002, len(img_df))
-    if "bearing" not in img_df.columns:
-        img_df["bearing"] = None
+    # Load TrueSkill outcomes
+    if resolved_trueskill_paths is not None:
+        print(f"[Pipeline] Loading TrueSkill outcomes from: {resolved_trueskill_paths}")
+        trueskill_df = pd.read_csv(resolved_trueskill_paths) if isinstance(resolved_trueskill_paths, str) else pd.concat([pd.read_csv(p) for p in resolved_trueskill_paths])
+    else:
+        print("[Pipeline] TrueSkill outcomes omitted (None).")
+        trueskill_df = pd.DataFrame()
 
-    # -------------------------------------------------------------------------
-    # 2. HUMAN SURVEY DATA — click counts and unique respondents
-    # -------------------------------------------------------------------------
-    print(f"[Pipeline] Loading human clicks from: {abs_human_paths}")
-    human_df = pd.concat(
-        [pd.read_csv(p) for p in abs_human_paths], ignore_index=True
-    )
+    # Load StreetScore ML outcomes
+    if resolved_streetscore_paths is not None:
+        print(f"[Pipeline] Loading StreetScore outcomes from: {resolved_streetscore_paths}")
+        streetscore_df = pd.read_csv(resolved_streetscore_paths) if isinstance(resolved_streetscore_paths, str) else pd.concat([pd.read_csv(p) for p in resolved_streetscore_paths])
+    else:
+        print("[Pipeline] StreetScore outcomes omitted (None).")
+        streetscore_df = pd.DataFrame()
 
+    # Strip any trailing/leading whitespaces from all loaded columns
+    img_df.columns = img_df.columns.str.strip()
+    if not trueskill_df.empty:
+        trueskill_df.columns = trueskill_df.columns.str.strip()
+    if not streetscore_df.empty:
+        streetscore_df.columns = streetscore_df.columns.str.strip()
+
+    # Normalize lat/lon column names
+    if "lon" in img_df.columns: img_df.rename(columns={"lon": "x"}, inplace=True)
+    if "lat" in img_df.columns: img_df.rename(columns={"lat": "y"}, inplace=True)
+    
+    # Fill in default mock bearings/coords if missing
+    if "x" not in img_df.columns: img_df["x"] = 8.6821 + np.random.normal(0, 0.002, len(img_df))
+    if "y" not in img_df.columns: img_df["y"] = 50.1109 + np.random.normal(0, 0.002, len(img_df))
+    if "bearing" not in img_df.columns: img_df["bearing"] = None
+
+    # Define a robust clean function for img_id keys to bypass type coercion issues (.0 ending)
+    def clean_img_id(val):
+        if pd.isna(val):
+            return ""
+        s = str(val).strip()
+        if s.endswith(".0"):
+            s = s[:-2]
+        return s
+
+    # Apply robust cleaning to all img_id values across all datasets
+    img_df["img_id"] = img_df["img_id"].apply(clean_img_id)
+    if not trueskill_df.empty:
+        trueskill_df["img_id"] = trueskill_df["img_id"].apply(clean_img_id)
+    if not streetscore_df.empty:
+        streetscore_df["img_id"] = streetscore_df["img_id"].apply(clean_img_id)
+
+    # Normalize source-of-truth metadata columns to lowercase & stripped for case-insensitive joins/filters
+    if "img_type" in img_df.columns:
+        img_df["img_type"] = img_df["img_type"].astype(str).str.strip().str.lower()
+    if "scenario" in img_df.columns:
+        img_df["scenario"] = img_df["scenario"].astype(str).str.strip().str.lower()
+
+    # Re-merge img_type and scenario from img_df as source of truth if they exist in img_df
+    cols_to_merge = ["img_id"]
+    if "img_type" in img_df.columns:
+        cols_to_merge.append("img_type")
+    if "scenario" in img_df.columns:
+        cols_to_merge.append("scenario")
+
+    # For TrueSkill metadata alignment
+    if not trueskill_df.empty:
+        # Drop paths or other redundant metadata columns that might be stale, inaccurate, or wrong
+        for col in ["path", "_base_dir", "abs_path", "img_type", "scenario"]:
+            if col in trueskill_df.columns:
+                trueskill_df.drop(columns=[col], inplace=True)
+        if len(cols_to_merge) > 1:
+            trueskill_df = trueskill_df.merge(img_df[cols_to_merge], on="img_id", how="left")
+
+    # For StreetScore metadata alignment
+    if not streetscore_df.empty:
+        # Drop paths or other redundant metadata columns that might be stale, inaccurate, or wrong
+        for col in ["path", "_base_dir", "abs_path", "img_type", "scenario"]:
+            if col in streetscore_df.columns:
+                streetscore_df.drop(columns=[col], inplace=True)
+        if len(cols_to_merge) > 1:
+            streetscore_df = streetscore_df.merge(img_df[cols_to_merge], on="img_id", how="left")
+
+    # Extract split values if available
+    split_map = {}
+    if "split" in img_df.columns:
+        split_map.update(img_df.set_index("img_id")["split"].dropna().to_dict())
+    if not streetscore_df.empty and "split" in streetscore_df.columns:
+        split_map.update(streetscore_df.set_index("img_id")["split"].dropna().to_dict())
+    if not trueskill_df.empty and "split" in trueskill_df.columns:
+        split_map.update(trueskill_df.set_index("img_id")["split"].dropna().to_dict())
+    split_map = {clean_img_id(k): str(v).strip() for k, v in split_map.items()}
+
+    # Calculate survey stats
     unique_users = int(human_df["user_id"].nunique()) if "user_id" in human_df.columns else 0
     if "type" in human_df.columns:
         total_clicks = int((human_df["type"] == "AB").sum())
     else:
         total_clicks = len(human_df)
 
-    # -------------------------------------------------------------------------
-    # 3. TRUESKILL SCORES — from human A/B survey outcomes
-    # -------------------------------------------------------------------------
-    if abs_trueskill_paths is not None:
-        print(f"[Pipeline] Loading TrueSkill outcomes from: {abs_trueskill_paths}")
-        trueskill_df = pd.concat(
-            [pd.read_csv(p) for p in abs_trueskill_paths], ignore_index=True
-        )
-    else:
-        print("[Pipeline] TrueSkill outcomes omitted (None).")
-        trueskill_df = pd.DataFrame()
-
-    # -------------------------------------------------------------------------
-    # 4. STREETSCORE PREDICTIONS — from ML model
-    #    Path columns (_base_dir, abs_path, path) are intentionally ignored;
-    #    image paths always come from images.csv (img_df).
-    # -------------------------------------------------------------------------
-    if abs_streetscore_paths is not None:
-        print(f"[Pipeline] Loading StreetScore predictions from: {abs_streetscore_paths}")
-        streetscore_df = pd.concat(
-            [pd.read_csv(p) for p in abs_streetscore_paths], ignore_index=True
-        )
-        # Drop any machine-specific path columns so they can never bleed through.
-        streetscore_df.drop(
-            columns=[c for c in ("path", "_base_dir", "abs_path") if c in streetscore_df.columns],
-            inplace=True,
-        )
-    else:
-        print("[Pipeline] StreetScore predictions omitted (None).")
-        streetscore_df = pd.DataFrame()
-
-    # -------------------------------------------------------------------------
-    # 5. BUILD MASTER POINTS INDEX keyed by img_id
-    #    img_path is always taken from img_df (images.csv), already ROOT_PATH-relative.
-    # -------------------------------------------------------------------------
+    # Compile the final mapping of points
     points_dict: dict[str, dict] = {}
-    for _, row in img_df.iterrows():
-        img_id = str(row["img_id"])
+
+    # Initialize master index for each image
+    for _, img_row in img_df.iterrows():
+        img_id = str(img_row["img_id"])
+        # Format path to be relative to ROOT_PATH for portability
+        rel_path = str(img_row["path"])
+        
         points_dict[img_id] = {
-            "id":       img_id,
-            "x":        float(row["x"])       if pd.notna(row.get("x"))       else None,
-            "y":        float(row["y"])        if pd.notna(row.get("y"))       else None,
-            "bearing":  float(row["bearing"])  if pd.notna(row.get("bearing")) else None,
-            "img_path": str(row["path"]),   # ROOT_PATH-relative
-            "metrics":  {}
+            "id": img_id,
+            "x": float(img_row["x"]) if pd.notna(img_row["x"]) else None,
+            "y": float(img_row["y"]) if pd.notna(img_row["y"]) else None,
+            "bearing": float(img_row["bearing"]) if pd.notna(img_row["bearing"]) else None,
+            "img_path": rel_path,
+            "split": split_map.get(img_id, None),
+            "metrics": {}
         }
 
-    # -------------------------------------------------------------------------
-    # 6. PER-METRIC SCORE NORMALISATION & UNCERTAINTY SCALING
-    # -------------------------------------------------------------------------
+    # Loop through configured metrics and perform alignment/normalization
     for mconfig in METRICS_MAP:
-        metric_val    = mconfig["streetscore_metric"]
-        qid_val       = mconfig["question_id"]
-        img_type_val  = mconfig["img_type"]
-        scenario_val  = mconfig.get("scenario")
+        metric_val = mconfig["streetscore_metric"]
+        qid_val = mconfig["question_id"]
+        img_type_val = mconfig["img_type"]
+        scenario_val = mconfig.get("scenario")
 
+        # Determine target metric key
         metric_key = "-".join(metric_val) if isinstance(metric_val, list) else metric_val
+        
         print(f"[Pipeline] Processing metric: '{metric_key}'...")
 
-        # Column name lists
-        qids              = qid_val if isinstance(qid_val, list) else [qid_val]
-        ts_cols           = [f"score_{q}"     for q in qids]
-        ts_unc_cols       = [f"uncertainty_{q}" for q in qids]
+        # Prepare lists of columns
+        qids = qid_val if isinstance(qid_val, list) else [qid_val]
+        ts_cols = [f"score_{q}" for q in qids]
+        ts_unc_cols = [f"uncertainty_{q}" for q in qids]
         ts_n_answers_cols = [f"n_answers_{q}" for q in qids]
 
-        metrics        = metric_val if isinstance(metric_val, list) else [metric_val]
-        ss_cols        = list(metrics)
-        ss_unc_cols    = [f"uncertainty_mc_{m}" for m in metrics]
-        ss_entropy_cols = [f"entropy_{m}"       for m in metrics]
+        metrics = metric_val if isinstance(metric_val, list) else [metric_val]
+        ss_cols = [m for m in metrics]
+        ss_unc_cols = [f"uncertainty_mc_{m}" for m in metrics]
+        ss_entropy_cols = [f"entropy_{m}" for m in metrics]
 
-        # Filter by img_type / scenario
-        def _filter(df: pd.DataFrame, type_val, scen_val) -> pd.DataFrame:
-            if df.empty:
-                return df
-            if "img_type" in df.columns:
-                mask = df["img_type"].isin(type_val) if isinstance(type_val, list) else df["img_type"] == type_val
-                df = df[mask]
-            if scen_val is not None and "scenario" in df.columns:
-                mask = df["scenario"].isin(scen_val) if isinstance(scen_val, list) else df["scenario"] == scen_val
-                df = df[mask]
-            return df
+        # Filter matching records
+        ts_sub = trueskill_df.copy()
+        ss_sub = streetscore_df.copy()
 
-        ts_sub = _filter(trueskill_df.copy(),   img_type_val, scenario_val)
-        ss_sub = _filter(streetscore_df.copy(), img_type_val, scenario_val)
+        # Execute case-insensitive filters for robust joins and types comparison
+        if not ts_sub.empty and "img_type" in ts_sub.columns and img_type_val is not None:
+            if isinstance(img_type_val, list):
+                val_list_lower = [str(v).lower() for v in img_type_val]
+                filtered = ts_sub[ts_sub["img_type"].astype(str).str.lower().isin(val_list_lower)]
+                if not filtered.empty:
+                    ts_sub = filtered
+            else:
+                filtered = ts_sub[ts_sub["img_type"].astype(str).str.lower() == str(img_type_val).lower()]
+                if not filtered.empty:
+                    ts_sub = filtered
 
-        # Extract score series indexed by img_id
+        if not ss_sub.empty and "img_type" in ss_sub.columns and img_type_val is not None:
+            if isinstance(img_type_val, list):
+                val_list_lower = [str(v).lower() for v in img_type_val]
+                filtered = ss_sub[ss_sub["img_type"].astype(str).str.lower().isin(val_list_lower)]
+                if not filtered.empty:
+                    ss_sub = filtered
+            else:
+                filtered = ss_sub[ss_sub["img_type"].astype(str).str.lower() == str(img_type_val).lower()]
+                if not filtered.empty:
+                    ss_sub = filtered
+
+        if scenario_val is not None:
+            if not ts_sub.empty and "scenario" in ts_sub.columns:
+                if isinstance(scenario_val, list):
+                    sc_list_lower = [str(s).lower() for s in scenario_val]
+                    filtered = ts_sub[ts_sub["scenario"].astype(str).str.lower().isin(sc_list_lower)]
+                    if not filtered.empty:
+                        ts_sub = filtered
+                else:
+                    filtered = ts_sub[ts_sub["scenario"].astype(str).str.lower() == str(scenario_val).lower()]
+                    if not filtered.empty:
+                        ts_sub = filtered
+            if not ss_sub.empty and "scenario" in ss_sub.columns:
+                if isinstance(scenario_val, list):
+                    sc_list_lower = [str(s).lower() for s in scenario_val]
+                    filtered = ss_sub[ss_sub["scenario"].astype(str).str.lower().isin(sc_list_lower)]
+                    if not filtered.empty:
+                        ss_sub = filtered
+                else:
+                    filtered = ss_sub[ss_sub["scenario"].astype(str).str.lower() == str(scenario_val).lower()]
+                    if not filtered.empty:
+                        ss_sub = filtered
+
+        # Extract score sub-slices
         existing_ts_cols = [c for c in ts_cols if c in ts_sub.columns] if not ts_sub.empty else []
-        ts_scores = (
-            ts_sub.set_index("img_id")[existing_ts_cols].mean(axis=1)
-            if existing_ts_cols else pd.Series(dtype=float)
-        )
+        if existing_ts_cols:
+            ts_scores = ts_sub.set_index("img_id")[existing_ts_cols].mean(axis=1)
+        else:
+            ts_scores = pd.Series(dtype=float)
 
         existing_ss_cols = [c for c in ss_cols if c in ss_sub.columns] if not ss_sub.empty else []
-        ss_scores = (
-            ss_sub.set_index("img_id")[existing_ss_cols].mean(axis=1)
-            if existing_ss_cols else pd.Series(dtype=float)
-        )
+        if existing_ss_cols:
+            ss_scores = ss_sub.set_index("img_id")[existing_ss_cols].mean(axis=1)
+        else:
+            ss_scores = pd.Series(dtype=float)
 
-        ts_aligned, ss_aligned, ts_unc_mult, ss_unc_mult = normalize_and_align_distributions(
+        ts_aligned_vals, ss_aligned_vals, ts_unc_mult, ss_unc_mult = normalize_and_align_distributions(
             ts_scores, ss_scores
         )
 
-        # Write normalised values into the master points index
+        # Store aligned scores and scaled uncertainties in master points index
         for img_id in points_dict:
             ts_row = ts_sub[ts_sub["img_id"] == img_id] if not ts_sub.empty and "img_id" in ts_sub.columns else pd.DataFrame()
             ss_row = ss_sub[ss_sub["img_id"] == img_id] if not ss_sub.empty and "img_id" in ss_sub.columns else pd.DataFrame()
+            
+            ts_score = float(ts_aligned_vals.get(img_id, np.nan)) if not ts_aligned_vals.empty else np.nan
+            ss_score = float(ss_aligned_vals.get(img_id, np.nan)) if not ss_aligned_vals.empty else np.nan
 
-            ts_score = float(ts_aligned.get(img_id, np.nan)) if not ts_aligned.empty else np.nan
-            ss_score = float(ss_aligned.get(img_id, np.nan)) if not ss_aligned.empty else np.nan
-
-            # TrueSkill uncertainty (scaled to match aligned score distribution)
+            # Retrieve and scale TrueSkill uncertainty
             ts_unc = np.nan
-            existing_ts_unc = [c for c in ts_unc_cols if c in ts_row.columns] if not ts_row.empty else []
-            if existing_ts_unc:
-                ts_unc = float(ts_row.iloc[0][existing_ts_unc].mean()) * ts_unc_mult
-                if pd.isna(ts_unc):
-                    ts_unc = 0.5 * ts_unc_mult
+            existing_ts_unc_cols = [c for c in ts_unc_cols if c in ts_row.columns] if not ts_row.empty else []
+            if not ts_row.empty and existing_ts_unc_cols:
+                ts_unc = float(ts_row.iloc[0][existing_ts_unc_cols].mean()) * ts_unc_mult
+                if pd.isna(ts_unc): ts_unc = 0.5 * ts_unc_mult
 
-            # StreetScore uncertainty: prefer MC dropout, fall back to entropy
+            # Retrieve and scale StreetScore uncertainty
             ss_unc = np.nan
-            existing_ss_unc     = [c for c in ss_unc_cols     if c in ss_row.columns] if not ss_row.empty else []
-            existing_ss_entropy = [c for c in ss_entropy_cols if c in ss_row.columns] if not ss_row.empty else []
-            if existing_ss_unc:
-                ss_unc = float(ss_row.iloc[0][existing_ss_unc].mean()) * ss_unc_mult
-            elif existing_ss_entropy:
-                ss_unc = float(ss_row.iloc[0][existing_ss_entropy].mean()) * 1.5 * ss_unc_mult
-
-            # Answer count from TrueSkill rows
+            existing_ss_unc_cols = [c for c in ss_unc_cols if c in ss_row.columns] if not ss_row.empty else []
+            existing_ss_entropy_cols = [c for c in ss_entropy_cols if c in ss_row.columns] if not ss_row.empty else []
+            
+            if not ss_row.empty and existing_ss_unc_cols:
+                ss_unc = float(ss_row.iloc[0][existing_ss_unc_cols].mean()) * ss_unc_mult
+            elif not ss_row.empty and existing_ss_entropy_cols:
+                ss_unc = float(ss_row.iloc[0][existing_ss_entropy_cols].mean()) * 1.5 * ss_unc_mult
+                
+            # Grab answers count
             n_answers = None
-            existing_ts_n_ans = [c for c in ts_n_answers_cols if c in ts_row.columns] if not ts_row.empty else []
-            if existing_ts_n_ans:
-                n_answers = int(ts_row.iloc[0][existing_ts_n_ans].sum())
+            existing_ts_n_ans_cols = [c for c in ts_n_answers_cols if c in ts_row.columns] if not ts_row.empty else []
+            if not ts_row.empty and existing_ts_n_ans_cols:
+                n_answers = int(ts_row.iloc[0][existing_ts_n_ans_cols].sum())
 
+            # Populate metrics tree
             points_dict[img_id]["metrics"][metric_key] = {
                 "trueskill": {
-                    "score":      None if pd.isna(ts_score) else round(ts_score, 4),
-                    "uncertainty": None if pd.isna(ts_unc)   else round(ts_unc,   4),
-                    "n_answers":  n_answers,
+                    "score": None if pd.isna(ts_score) else ts_score,
+                    "uncertainty": None if pd.isna(ts_unc) else ts_unc,
+                    "n_answers": n_answers
                 },
                 "streetscore": {
-                    "score":      None if pd.isna(ss_score) else round(ss_score, 4),
-                    "uncertainty": None if pd.isna(ss_unc)   else round(ss_unc,   4),
-                    "n_answers":  None,
-                },
+                    "score": None if pd.isna(ss_score) else ss_score,
+                    "uncertainty": None if pd.isna(ss_unc) else ss_unc,
+                    "n_answers": None
+                }
             }
 
+    # Convert dictionary to list of records
     compiled_points = list(points_dict.values())
-    return compiled_points, unique_users, total_clicks
+    has_trueskill = TRUESKILL_DF_PATHS is not None
+    has_streetscore = STREETSCORE_DF_PATHS is not None
+    return compiled_points, unique_users, total_clicks, has_trueskill, has_streetscore
 
+# REALISTIC SIMULATION GENERATOR has been moved to utils.py
 
 # ============================================================================
-# ENTRYPOINT
+# PIPELINE EXECUTION ENTRYPOINT
 # ============================================================================
-
 if __name__ == "__main__":
     print("=" * 65)
-    print("   FRANKFURT ANLAGENRING — PERCEPTION DATA MAPPING SYSTEM   ")
+    print("      FRANKFURT ANLAGENRING PERCEPTION DATA MAPPING SYSTEM      ")
     print("=" * 65)
-
-    points, users, clicks = load_and_compile_perceptions()
-
-    metrics_list   = list(points[0]["metrics"].keys()) if points else ["walk", "bike", "stay"]
+    
+    # 1. Load and compile dataset
+    points, users, clicks, has_ts, has_ss = load_and_compile_perceptions()
+    
+    # 2. Extract metrics list
+    metrics_list = list(points[0]["metrics"].keys()) if points else ["walk", "bike", "stay"]
     default_metric = "walk" if "walk" in metrics_list else metrics_list[0]
-
-    output_html = os.path.join(ROOT_PATH, "map.html")
-
+    
+    # 3. Output path
+    output_html_file = os.path.join(ROOT_PATH, "map.html")
+    
+    # 4. Trigger Folium builder
     generate_custom_html_map(
         points_data=points,
         unique_users=users,
         total_clicks=clicks,
         metrics_list=metrics_list,
         default_metric=default_metric,
-        output_path=output_html,
+        output_path=output_html_file,
+        has_trueskill=has_ts,
+        has_streetscore=has_ss
     )
-
+    
     print("-" * 65)
-    print("Success! Perceptual map compiled.")
-    print(f"Interactive file: {output_html}")
+    print(f"Success! Perceptual map successfully compiled!")
+    print(f"Interactive File: {output_html_file}")
     print("=" * 65)

@@ -1,132 +1,89 @@
-# Street Perception Mapping System
+# Frankfurt Anlagenring Street Perception Map
 
-An end-to-end pipeline that ingests human A/B survey data and ML model predictions,
-normalises both into a common score space, and renders them as an interactive
-Leaflet map overlay with floating dashboard, colormapped markers, uncertainty
-brackets, and side-by-side image popups.
+An end-to-end multi-model, multi-metric street perception mapping and comparison system. It ingests survey responses and machine-learning predictions, aligns their distributions, resolves geographic positions, and compiles them into a beautiful, highly interactive Leaflet dashboard overlay.
 
 ---
 
-## Project layout
+## 📊 Score Normalization, Mean Alignment, and Scaling Math
 
-```
-ABsurveys/                          ← ROOT_PATH
-│
-├── main.py                         ← pipeline entry point (configure & run this)
-├── map.py                          ← Folium/Leaflet HTML generator
-├── utils.py                        ← score normalisation & simulation helpers
-├── map.css / map.js                ← dashboard UI (loaded by map.py at build time)
-│
-├── images/
-│   └── Anlagenring/
-│       ├── images.csv              ← master image index  ← single source of truth for paths
-│       ├── database.swm2           ← optional SQLite DB with GPS + bearing metadata
-│       ├── Walk/  Bike/  Stay/     ← actual image files
-│
-├── user_data/
-│   ├── Anlagenring_user_data_merged.csv       ← raw A/B click log
-│   └── Anlagenring_user_images_merged.csv     ← TrueSkill scores per image
-│
-├── evaluation/streetscore/models/
-│   └── FrankfurtAnlagenring/
-│       └── scores.csv              ← ML model predictions
-│
-└── map.html                        ← ✅ generated output
-```
+To make two completely different score distributions (e.g., TrueSkill model scores vs. StreetScore deep learning predictions) directly comparable side-by-side without changing their relative rankings or ratios, the system applies a dual-distribution alignment algorithm located in `utils.py`. 
 
----
+Here is the exact mathematical step-by-step process used to normalize, align, and scale the scores and their corresponding uncertainties:
 
-## Data sources and their roles
+### 1. Zero-Centering (Mean Alignment)
+First, the mean ($\mu$) of each score distribution (TrueSkill $X$ and StreetScore $Y$) is calculated, and subtracted from each data point to align their centers perfectly at $0.0$:
+$$x_{\text{zero}} = x - \mu_x$$
+$$y_{\text{zero}} = y - \mu_y$$
 
-| File | Key columns used | Notes |
-|---|---|---|
-| `images/Anlagenring/images.csv` | `img_id`, `path`, `img_type`, `scenario` | **Only** source of image file paths. Paths inside are relative to this file's directory and are re-expressed relative to `ROOT_PATH` at load time. |
-| `user_data/Anlagenring_user_data_merged.csv` | `user_id`, `type` | Used only to count unique respondents and total A/B clicks. |
-| `user_data/Anlagenring_user_images_merged.csv` | `img_id`, `img_type`, `scenario`, `score_<question_id>`, `uncertainty_<question_id>`, `n_answers_<question_id>` | TrueSkill ratings derived from pairwise comparisons. Path columns in this file are ignored. |
-| `evaluation/…/scores.csv` | `img_id`, `img_type`, `scenario`, `<metric>`, `uncertainty_mc_<metric>`, `entropy_<metric>` | CNN/ML walkability, bikeability, stayability scores. Path columns (`path`, `_base_dir`, `abs_path`) are explicitly dropped on load. |
-| `images/Anlagenring/database.swm2` | `lat`, `lon`, `bearing` | Optional SQLite database. When present, GPS coordinates and camera bearing are merged into the image index by filename. If absent, coordinate columns from `images.csv` are used (or random Frankfurt-area fallback values). |
+### 2. Standardization (Unit Variance Scaling)
+The standard deviations ($\sigma$) of the zero-centered series are computed:
+$$\sigma_x = \text{std}(x_{\text{zero}})$$
+$$\sigma_y = \text{std}(y_{\text{zero}})$$
 
-**Image path resolution rule:**
-1. Read `path` from `images.csv` (relative to its own directory, e.g. `Walk/image.jpg`).
-2. Combine with the CSV directory to get an absolute path.
-3. Re-express as a path **relative to `ROOT_PATH`** (e.g. `images/Anlagenring/Walk/image.jpg`).
-4. Store that relative path in the JSON embedded in `map.html` so the browser can load images via simple relative URLs.
+We then standardize both series to unit variance (mean = $0.0$, standard deviation = $1.0$):
+$$x_{\text{std}} = \frac{x_{\text{zero}}}{\sigma_x}$$
+$$y_{\text{std}} = \frac{y_{\text{zero}}}{\sigma_y}$$
 
----
+### 3. Absolute Bounds Optimization
+To map both distributions to a global absolute scale of $[0.0, 10.0]$ without any hard clipping, we find the maximum absolute deviation from the mean across *both* distributions combined:
+$$D_{\text{max}} = \max\left( \max(|x_{\text{std}}|), \max(|y_{\text{std}}|) \right)$$
 
-## Score normalisation
+This combined maximum value represents the single furthest point from the mean in either distribution.
 
-TrueSkill (human) and StreetScore (ML) scores live on different scales.
-`normalize_and_align_distributions()` in `utils.py`:
+### 4. Target Scale Calculation
+We calculate a target standard deviation ($\sigma_{\text{target}}$) that will stretch or compress both distributions so that this maximum deviation is exactly $5.0$ (allowing the entire dataset to span perfectly within $[0.0, 10.0]$ when centered at $5.0$):
+$$\sigma_{\text{target}} = \frac{5.0}{D_{\text{max}}}$$
 
-1. Zero-centres both distributions independently.
-2. Standardises each to unit variance.
-3. Finds the **global** maximum absolute deviation across both sets.
-4. Scales both so the most extreme point sits at exactly 0 or 10, with the mean anchored at 5.
+### 5. Final Projection & Translation
+We project the standardized scores back using the computed target standard deviation, and translate the center to $5.0$:
+$$x_{\text{aligned}} = 5.0 + \left(x_{\text{std}} \cdot \sigma_{\text{target}}\right)$$
+$$y_{\text{aligned}} = 5.0 + \left(y_{\text{std}} \cdot \sigma_{\text{target}}\right)$$
 
-This guarantees that both models are directly comparable on the map legend
-(0 = worst, 5 = average, 10 = best) without distorting relative rankings.
-The same scale factor is applied to each model's uncertainty values so that
-confidence intervals remain proportional to the scores.
+This mathematical transform guarantees that:
+* Both models' means are perfectly aligned at **5.0**.
+* Both models share the exact same standard deviation, matching their distributions.
+* The absolute extreme data point in either dataset sits exactly at **0.0** or **10.0**, maximizing color contrast on the map without any value clipping.
+
+### 6. Uncertainty Scaling Multipliers
+Because the scores are scaled by the factors $M_x = \frac{\sigma_{\text{target}}}{\sigma_x}$ and $M_y = \frac{\sigma_{\text{target}}}{\sigma_y}$, their corresponding uncertainty values (standard error or entropy) must be scaled by the **exact same multipliers** to keep the comparison brackets proportionally accurate:
+$$\text{Uncertainty}_x^{\text{scaled}} = \text{Uncertainty}_x \cdot M_x$$
+$$\text{Uncertainty}_y^{\text{scaled}} = \text{Uncertainty}_y \cdot M_y$$
+
+This ensures that the double-decker comparisons, error bars, and uncertainty maps show true relative confidence levels.
 
 ---
 
-## Configuration (`main.py`)
+## 🛠️ Data Configuration & Flexibility
 
-All paths in the `CONFIGURATION` block are **relative to `ROOT_PATH`** and are
-resolved to absolute paths at runtime — you never need to hard-code absolute paths
-anywhere except `ROOT_PATH` itself.
+The pipeline (`main.py`) supports highly flexible configuration parameters:
 
+### 1. Omission of Models (`None` handling)
+If you do not wish to display one of the models (e.g. `streetscore` or `trueskill`) on the map:
+* Set `STREETSCORE_DF_PATHS = None` or `TRUESKILL_DF_PATHS = None` in the `CONFIGURATION` section of `main.py`.
+* The dashboard dynamically detects which models are missing, hides the model switch overlay, disables the "difference" comparison mode, and adjusts the layout beautifully.
+
+### 2. Multi-CSV Concatenation
+When your datasets are split across multiple files, you can define them as lists:
 ```python
-ROOT_PATH = "/path/to/ABsurveys"       # ← only absolute path you need to set
-
-IMG_PATHS            = "images/Anlagenring/images.csv"
-HUMAN_DF_PATHS       = "user_data/Anlagenring_user_data_merged.csv"
-TRUESKILL_DF_PATHS   = "user_data/Anlagenring_user_images_merged.csv"
-STREETSCORE_DF_PATHS = "evaluation/streetscore/models/FrankfurtAnlagenring/scores.csv"
-SWM2_DATABASE_PATH   = "images/Anlagenring/database.swm2"   # set to None if unavailable
+TRUESKILL_DF_PATHS = [
+    "/path/to/trueskill_walk_scores.csv",
+    "/path/to/trueskill_bike_scores.csv"
+]
 ```
+The pipeline automatically loads and concatenates them into a single dataframe using `pd.concat`.
 
-Each entry in `METRICS_MAP` links:
-- `streetscore_metric` — column name in `scores.csv` (e.g. `"walk"`)
-- `question_id` — question key in the TrueSkill CSV (e.g. `"walk-preference"`)
-- `img_type` — filter value matching the `img_type` column in all CSVs
-- `scenario` — optional scenario filter (e.g. `"Anlagenring"`)
+### 3. File Path Relativity & Integrity
+* **ROOT_PATH**: All configuration paths in `main.py` are resolved relative to `ROOT_PATH`.
+* **images.csv Relativity**: File paths declared inside `images.csv` are resolved relative to `images.csv`'s parent directory, making it highly portable.
+* **Metadata Alignment**: The pipeline ignores stale path and type columns in `scores.csv` or model outputs. It merges coordinate, type, and scenario metadata using `img_df` as the single source of truth, preventing missing or incorrectly classified scores (e.g., ensuring bike/stay images display correctly).
 
 ---
 
-## Running
+## 🎛️ Interactive UI Filter Splits
 
-```bash
-# Install dependencies (once)
-pip install folium branca pandas numpy
-
-# Run the pipeline
-python main.py
-```
-
-If any of the data files are missing the pipeline falls back to a built-in
-simulation that generates realistic mock data for the Frankfurt Anlagenring
-ring road, so `map.html` is always produced and the dashboard is fully
-functional for UI development and demos.
-
-The output `map.html` is a single self-contained file. Open it directly in a
-browser (served via a local web server if images are to load from disk):
-
-```bash
-cd /path/to/ABsurveys
-python -m http.server 8080
-# then open http://localhost:8080/map.html
-```
-
----
-
-## Map dashboard features
-
-- **Model switch** — toggle between TrueSkill (human), StreetScore (ML), or their difference.
-- **Mode switch** — display score values or uncertainty intervals.
-- **Metric buttons** — switch between walk / bike / stay perception scores.
-- **Colormapped markers** — marker colour encodes the selected score on a 0–10 scale.
-- **Uncertainty brackets** — visual confidence intervals rendered on each tooltip.
-- **Click popup** — side-by-side image viewer with fullscreen mode.
-- **Survey stats** — live respondent count and total click count in the corner panel.
+If your dataset contains a `split` column (representing dataset partitions like train/test/val, or other categories), the dashboard will:
+1. Show the split name in a dedicated badge inside the image popup details panel.
+2. Automatically build a checkbox group under the control panel titled **"filter splits"**.
+3. Allow you to activate or deactivate multiple split checkboxes to filter which markers show on the map in real-time.
+4. Render an **"Other"** checkbox to filter any images that lack a split value.
+5. If the `split` column is completely absent, the filter panel remains hidden, ensuring zero UI clutter.

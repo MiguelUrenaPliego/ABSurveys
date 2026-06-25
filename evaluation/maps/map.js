@@ -4,9 +4,16 @@
 let currentModel = 'streetscore'; // 'streetscore', 'trueskill', or 'difference'
 let currentMode = 'score'; // 'score' or 'uncertainty'
 let currentMetric = '__DEFAULT_METRIC__'; // Will be replaced in python
+const hasTrueskill = __HAS_TRUESKILL__;
+const hasStreetscore = __HAS_STREETSCORE__;
+
+// Active splits filter state
+let uniqueSplits = []; // all unique splits found in the dataset
+let activeSplits = {}; // splitName -> boolean
 
 // Dynamic limits for colormaps
 let diffLimit = 1.0;
+let uncertaintyMin = 0.0;
 let uncertaintyLimit = 3.0;
 
 function getPercentile(arr, q) {
@@ -62,9 +69,12 @@ function calculateUncertaintyBounds() {
         }
     });
     if (uncs.length > 0) {
+        const p10 = getPercentile(uncs, 0.10);
         const p90 = getPercentile(uncs, 0.90);
-        uncertaintyLimit = p90 > 0 ? p90 : 1.0;
+        uncertaintyMin = p10;
+        uncertaintyLimit = p90 > p10 ? p90 : p10 + 1.0;
     } else {
+        uncertaintyMin = 0.0;
         uncertaintyLimit = 3.0;
     }
 }
@@ -90,8 +100,10 @@ function getScoreColor(val) {
 
 function getUncertaintyColor(val) {
     if (val === null || val === undefined || isNaN(val)) return '#64748b';
-    val = Math.max(0, Math.min(uncertaintyLimit, val));
-    let ratio = val / uncertaintyLimit;
+    const minVal = typeof uncertaintyMin !== 'undefined' ? uncertaintyMin : 0;
+    val = Math.max(minVal, Math.min(uncertaintyLimit, val));
+    const denom = uncertaintyLimit - minVal;
+    let ratio = denom > 0 ? (val - minVal) / denom : 0;
     let r = Math.round(186 + (2 - 186) * ratio);
     let g = Math.round(230 + (132 - 230) * ratio);
     let b = Math.round(253 + (199 - 253) * ratio);
@@ -158,8 +170,12 @@ function initLeafletOverlays() {
 // Get value for current state
 function getPointValue(point, model, mode, metric) {
     if (model === 'difference') {
+        if (!hasTrueskill || !hasStreetscore) return null;
         return getDiffValue(point, metric);
     }
+    if (model === 'streetscore' && !hasStreetscore) return null;
+    if (model === 'trueskill' && !hasTrueskill) return null;
+    
     const metricData = point.metrics[metric];
     if (!metricData || !metricData[model]) return null;
     return metricData[model][mode];
@@ -209,6 +225,13 @@ function generateTooltipHtml(point, targetMetric) {
     const diffBg = diffVal !== null ? getDiffColor(diffVal) : 'transparent';
     const diffTextColor = diffVal !== null ? getDiffTextColor(diffVal) : '#ffffff';
 
+    const splitBadgeHtml = point.split ? `
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px; font-size: 9px; border-bottom: 1px solid rgba(255, 255, 255, 0.05); padding-bottom: 4px; font-family: sans-serif;">
+            <span style="color: #94a3b8; font-weight: 600;">split</span>
+            <span style="background: rgba(56, 189, 248, 0.1); color: #38bdf8; border: 1px solid rgba(56, 189, 248, 0.2); padding: 1px 4px; border-radius: 3px; font-weight: 700; font-size: 8px; text-transform: uppercase;">${point.split}</span>
+        </div>
+    ` : '';
+
     return `
         <div class="custom-tooltip-wrapper">
             <div class="tooltip-header">
@@ -216,7 +239,9 @@ function generateTooltipHtml(point, targetMetric) {
                 <span style="text-transform: uppercase; font-size: 9px; color: #38bdf8; font-weight: 700;">${targetMetric}</span>
             </div>
 
-            ${diffVal !== null ? `
+            ${splitBadgeHtml}
+
+            ${(hasTrueskill && hasStreetscore && diffVal !== null) ? `
             <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px; font-size: 9px; font-weight: 700; border-bottom: 1px solid rgba(255, 255, 255, 0.05); padding-bottom: 4px;">
                 <span style="color: #94a3b8;">difference (ts - ss)</span>
                 <span style="background: ${diffBg}; color: ${diffTextColor}; padding: 1px 4px; border-radius: 3px; font-family: monospace;">
@@ -226,6 +251,7 @@ function generateTooltipHtml(point, targetMetric) {
             ` : ''}
 
             <!-- STREETSCORE ROW -->
+            ${hasStreetscore ? `
             <div class="comparison-bar-group">
                 <div class="bar-label-row">
                     <span>streetscore</span>
@@ -246,9 +272,11 @@ function generateTooltipHtml(point, targetMetric) {
                     ` : ''}
                 </div>
             </div>
+            ` : ''}
 
             <!-- TRUESKILL ROW -->
-            <div class="comparison-bar-group" style="border-top: 1px solid rgba(255,255,255,0.05); padding-top: 6px; margin-top: 4px;">
+            ${hasTrueskill ? `
+            <div class="comparison-bar-group" style="${hasStreetscore ? 'border-top: 1px solid rgba(255,255,255,0.05); padding-top: 6px; margin-top: 4px;' : ''}">
                 <div class="bar-label-row">
                     <span>trueskill</span>
                     <span class="bar-label-highlight">
@@ -268,6 +296,7 @@ function generateTooltipHtml(point, targetMetric) {
                     ` : ''}
                 </div>
             </div>
+            ` : ''}
 
             <div style="display: flex; justify-content: space-between; align-items: center; margin-top: 4px; border-top: 1px solid rgba(255,255,255,0.05); padding-top: 4px;">
                 <span class="answers-count">
@@ -309,6 +338,14 @@ function renderMarkers() {
 
     mapPoints.forEach(point => {
         if (point.x === null || point.y === null) return;
+
+        // Apply Split Filtering if splits are available
+        if (uniqueSplits.length > 0) {
+            const ptSplit = point.split || 'Other';
+            if (activeSplits[ptSplit] === false) {
+                return; // skipped as unchecked
+            }
+        }
 
         const val = getPointValue(point, currentModel, currentMode, currentMetric);
         if (val === null) return;
@@ -372,21 +409,30 @@ function setModel(modelName) {
     const optDiff = document.getElementById('opt-difference');
     const modeSwitchGroup = document.getElementById('mode-switch-group');
 
-    optSS.classList.remove('active');
-    optTS.classList.remove('active');
-    optDiff.classList.remove('active');
+    if (optSS) optSS.classList.remove('active');
+    if (optTS) optTS.classList.remove('active');
+    if (optDiff) optDiff.classList.remove('active');
+
+    // Count available models
+    const availableCount = (hasStreetscore ? 1 : 0) + (hasTrueskill ? 1 : 0) + ((hasStreetscore && hasTrueskill) ? 1 : 0);
 
     if (modelName === 'streetscore') {
-        switchEl.setAttribute('data-active', 'left');
-        optSS.classList.add('active');
+        if (switchEl) switchEl.setAttribute('data-active', 'left');
+        if (optSS) optSS.classList.add('active');
         if (modeSwitchGroup) modeSwitchGroup.style.display = 'block';
     } else if (modelName === 'trueskill') {
-        switchEl.setAttribute('data-active', 'middle');
-        optTS.classList.add('active');
+        if (switchEl) {
+            if (availableCount === 3) {
+                switchEl.setAttribute('data-active', 'middle');
+            } else {
+                switchEl.setAttribute('data-active', 'right');
+            }
+        }
+        if (optTS) optTS.classList.add('active');
         if (modeSwitchGroup) modeSwitchGroup.style.display = 'block';
     } else if (modelName === 'difference') {
-        switchEl.setAttribute('data-active', 'right');
-        optDiff.classList.add('active');
+        if (switchEl) switchEl.setAttribute('data-active', 'right');
+        if (optDiff) optDiff.classList.add('active');
         
         // Force mode to score since difference doesn't have uncertainty
         currentMode = 'score';
@@ -460,7 +506,7 @@ function updateLegend() {
     } else {
         minTitle.innerText = "low unc";
         maxTitle.innerText = "high unc";
-        minVal.innerText = "0";
+        minVal.innerText = `${uncertaintyMin.toFixed(2)}`;
         maxVal.innerText = `${uncertaintyLimit.toFixed(2)}`;
         colorBar.className = "legend-bar uncertainty-track";
     }
@@ -500,8 +546,113 @@ function closeFullscreen() {
     }
 }
 
+// Dynamically build model switcher depending on model availability
+function setupModelSwitch() {
+    const group = document.getElementById('model-switch-group');
+    if (!group) return;
+
+    // Check how many models are available
+    const available = [];
+    if (hasStreetscore) available.push('streetscore');
+    if (hasTrueskill) available.push('trueskill');
+    if (hasStreetscore && hasTrueskill) available.push('difference');
+
+    if (available.length <= 1) {
+        // Only one model or none, we don't need a model switch!
+        group.style.display = 'none';
+        // Set currentModel to the only available one
+        if (available.length === 1) {
+            currentModel = available[0];
+        }
+        return;
+    }
+
+    // Otherwise, construct a custom styled switch
+    let containerClass = 'switch-container';
+    if (available.length === 3) {
+        containerClass += ' three-way';
+    }
+
+    let optionsHtml = '';
+    available.forEach((mod, idx) => {
+        const activeClass = (mod === currentModel) ? 'active' : '';
+        optionsHtml += `<div class="switch-option ${activeClass}" id="opt-${mod}" onclick="setModel('${mod}')">${mod}</div>`;
+    });
+
+    group.innerHTML = `
+        <div class="${containerClass}" id="model-switch" data-active="left">
+            <div class="switch-slider"></div>
+            ${optionsHtml}
+        </div>
+    `;
+    
+    // Set initial model safely
+    if (!available.includes(currentModel)) {
+        currentModel = available[0];
+    }
+}
+
+// Dynamically construct split filter check list
+function setupSplitFilter() {
+    const group = document.getElementById('split-filter-group');
+    if (!group) return;
+
+    // Scan mapPoints to collect all unique split values
+    const splitsSet = new Set();
+    mapPoints.forEach(p => {
+        if (p.split) {
+            splitsSet.add(p.split);
+        }
+    });
+
+    uniqueSplits = Array.from(splitsSet).sort();
+    
+    if (uniqueSplits.length === 0) {
+        group.style.display = 'none';
+        return;
+    }
+
+    // Add 'Other' category if there are some images with split and some without
+    const hasAnyWithoutSplit = mapPoints.some(p => !p.split);
+    if (hasAnyWithoutSplit) {
+        uniqueSplits.push('Other');
+    }
+
+    // Initialize all active by default
+    uniqueSplits.forEach(s => {
+        activeSplits[s] = true;
+    });
+
+    // Build the UI checkboxes
+    let checkboxesHtml = '<div class="switch-title" style="margin-bottom: 6px;">filter splits</div>';
+    checkboxesHtml += '<div style="display: flex; flex-direction: column; gap: 6px; padding: 4px 0;">';
+    
+    uniqueSplits.forEach(s => {
+        checkboxesHtml += `
+            <label style="display: flex; align-items: center; gap: 8px; cursor: pointer; font-size: 11px; color: #cbd5e1; user-select: none; margin-bottom: 2px;">
+                <input type="checkbox" id="chk-split-${s}" checked onchange="toggleSplitFilter('${s}')" style="accent-color: #38bdf8; cursor: pointer;" />
+                <span>${s}</span>
+            </label>
+        `;
+    });
+    checkboxesHtml += '</div>';
+
+    group.innerHTML = checkboxesHtml;
+    group.style.display = 'block';
+}
+
+function toggleSplitFilter(splitName) {
+    const chk = document.getElementById(`chk-split-${splitName}`);
+    if (chk) {
+        activeSplits[splitName] = chk.checked;
+    }
+    renderMarkers();
+}
+
 // Initialize overall dashboard on load
 window.addEventListener('DOMContentLoaded', () => {
+    setupModelSwitch();
+    setupSplitFilter();
     setupMetricGrid();
     updateLegend();
     initLeafletOverlays();

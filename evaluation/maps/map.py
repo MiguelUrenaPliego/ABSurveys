@@ -20,7 +20,9 @@ def generate_custom_html_map(
     total_clicks: int,
     metrics_list: list[str],
     default_metric: str,
-    output_path: str
+    output_path: str,
+    has_trueskill: bool = True,
+    has_streetscore: bool = True,
 ):
     """
     Generates a single self-contained HTML file (map.html) using Folium as a container, 
@@ -90,15 +92,8 @@ def generate_custom_html_map(
             <span>perception</span>
         </div>
 
-        <!-- Model Switch (streetscore vs trueskill vs difference) -->
-        <div class="switch-group">
-            <div class="switch-container three-way" id="model-switch" data-active="left">
-                <div class="switch-slider"></div>
-                <div class="switch-option active" id="opt-streetscore" onclick="setModel('streetscore')">streetscore</div>
-                <div class="switch-option" id="opt-trueskill" onclick="setModel('trueskill')">trueskill</div>
-                <div class="switch-option" id="opt-difference" onclick="setModel('difference')">difference</div>
-            </div>
-        </div>
+        <!-- Model Switch: built dynamically by JS based on available models -->
+        <div class="switch-group" id="model-switch-group"></div>
 
         <!-- Display Mode Switch (score vs uncertainty) -->
         <div class="switch-group" id="mode-switch-group">
@@ -108,6 +103,9 @@ def generate_custom_html_map(
                 <div class="switch-option" id="opt-uncertainty">uncertainty</div>
             </div>
         </div>
+
+        <!-- Split Filters Checkboxes: built dynamically by JS if split column exists -->
+        <div class="switch-group" id="split-filter-group" style="display: none;"></div>
 
         <!-- Metric Selector Buttons -->
         <div class="switch-group">
@@ -150,6 +148,8 @@ def generate_custom_html_map(
 
     # Wrap the loaded JS content and inject data
     js_content_processed = js_content.replace("'__DEFAULT_METRIC__'", f"'{default_metric}'")
+    js_content_processed = js_content_processed.replace("__HAS_TRUESKILL__", "true" if has_trueskill else "false")
+    js_content_processed = js_content_processed.replace("__HAS_STREETSCORE__", "true" if has_streetscore else "false")
     custom_js = f"""
     <script>
         // Data injected from Python

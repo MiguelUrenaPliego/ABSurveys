@@ -81,7 +81,49 @@ To prevent "AI Slop" and noisy outputs, **the system strictly respects these hyp
 
 ---
 
-### 3. Advanced Features & First-Release Details
+### 3. Loss-Aware Dataset Splitting (`dataset.py`)
+
+All splits are always performed **at the image level** — each `img_id` is randomly assigned to exactly one of train, val, or test. However, what happens to pairs that *cross* the split boundary (one image in train, one in val) depends on the active `LOSS` setting.
+
+#### Pair / Mixed mode (`LOSS = "pair"` or `"mixed"`)
+
+The pairwise ranking loss requires **both** images of a pair to be present in the same forward pass. A cross-split pair would expose a val-split image to the training gradient, leaking information across splits. The pipeline therefore applies `resolve_pairs_for_val_split` and **drops any pair whose two images land in different splits**.
+
+```
+img_id 1 → train  |  img_id 2 → train  |  img_id 3 → val
+pair a: 1 vs 2, img 1 wins  →  train gets pair a  (both in train)
+pair b: 1 vs 3, img 3 wins  →  DROPPED            (cross-split)
+```
+
+#### Crossentropy / Single-image mode (`LOSS = "crossentropy"`)
+
+Cross-entropy loss is computed **per image independently** — the model never sees a pair simultaneously. There is therefore no leakage risk from cross-split pairs. The pipeline instead applies `resolve_pairs_image_level`, which splits pairs at the image level: each image contributes its label row only to the split that owns that image.
+
+```
+img_id 1 → train  |  img_id 2 → train  |  img_id 3 → val
+pair a: 1 vs 2, img 1 wins  →  train: img 1 label 1, img 2 label 0
+pair b: 1 vs 3, img 3 wins  →  train: img 1 label 0       (one image)
+                             →  val:   img 3 label 1       (other image)
+```
+
+Cross-split pairs therefore contribute to *both* splits simultaneously, each side receiving only its own image. This is what the pipeline calls a **shared pair**: the pair is not duplicated wholesale, but each image appears exactly once in its own split's dataset. This maximises the training signal available from every comparison collected, particularly valuable when survey datasets are small.
+
+The `SingleImageDataset` (in `train.py`) implements this: it loads one image per sample and returns the same tensor for both the A and B slots expected by the training loop. Under cross-entropy, `targets = cat([label, 1-label])`, so both slots receive the true binary label pair — mathematically equivalent to standard binary cross-entropy on a single image, with no leakage.
+
+##### Impact on dataset size
+
+With 312 pairs and a 70/30 train/val image split, the real-world difference is visible in the logs:
+
+| Mode | Train samples | Val samples | Cross-split pairs |
+|------|--------------|-------------|-------------------|
+| pair / mixed | 173 pairs × 2 = 346 | 16 pairs × 2 = 32 | 123 dropped |
+| crossentropy | **501** single-image rows | **167** single-image rows | 123 shared |
+
+The crossentropy mode recovers all 123 cross-split pairs, yielding ~45% more training signal from the same survey data.
+
+---
+
+### 4. Advanced Features & First-Release Details
 
 #### A. Robust Resuming with Checkpoint Realignment & Validation Baseline Recomputation
 When resuming training from existing models (e.g., loading an existing `walk.pth`), our framework employs a smart checkpoint alignment and validation recomputation utility:
@@ -103,7 +145,7 @@ To maximize training generalization and robust street feature learning, our pipe
 
 ---
 
-### 4. Dual Uncertainty Framework (`uncertainty.py`)
+### 5. Dual Uncertainty Framework (`uncertainty.py`)
 
 Street images are inherently complex. To determine how sure the model is about its scores, we implement a dual uncertainty framework:
 

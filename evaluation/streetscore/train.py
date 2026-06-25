@@ -48,12 +48,15 @@ class EarlyStopping:
 
     Args:
         patience: Number of epochs without meaningful improvement before stopping.
+            Pass ``None`` to disable early stopping entirely.
         min_delta: Minimum absolute improvement in accuracy that counts as progress.
+            Pass ``None`` to disable early stopping entirely.
     """
 
-    def __init__(self, patience: int = 4, min_delta: float = 0.005) -> None:
+    def __init__(self, patience: int | None = 4, min_delta: float | None = 0.005) -> None:
         self.patience = patience
         self.min_delta = min_delta
+        self._enabled = patience is not None and min_delta is not None
         self._best: float = -1.0
         self._wait: int = 0
 
@@ -61,8 +64,11 @@ class EarlyStopping:
         """Call once per epoch with the current validation accuracy.
 
         Returns:
-            bool: True when training should stop.
+            bool: True when training should stop (always False when disabled).
         """
+        if not self._enabled:
+            return False
+
         if val_acc >= self._best + self.min_delta:
             self._best = val_acc
             self._wait = 0
@@ -282,6 +288,95 @@ class ABPairDataset(Dataset):
         return self.transform(img_a), self.transform(img_b), label, is_tie
 
 
+class SingleImageDataset(Dataset):
+    """Converts single-image label rows (output of build_single_image_df / resolve_pairs_image_level)
+    into a Dataset compatible with the existing training loop.
+
+    Used when loss_hyperparam == "crossentropy" to correctly handle cross-split
+    pairs: only the image that belongs to this split is loaded; the other image
+    from the pair is not needed and never loaded.
+
+    To keep the training loop unchanged (it expects batches of image_A, image_B,
+    label, is_tie), we synthesise a *dummy* second image by returning the same
+    tensor for both slots.  The crossentropy loss path only uses the concatenated
+    logits and the symmetric targets derived from label, so both slots contribute
+    meaningfully:
+
+        images = cat([image_A, image_B], dim=0)   → [img, img]
+        targets = cat([label, 1-label], dim=0)     → [label, 1-label]
+
+    This means each single-image row is seen twice per forward pass (once as its
+    true label, once as the complement), which is exactly the binary cross-entropy
+    convention and does not introduce any leakage.
+
+    Args:
+        single_img_df: Output of :func:`build_single_image_df` or
+            :func:`resolve_pairs_image_level` — must have columns
+            ``img_id``, ``label``, ``is_tie``.
+        img_df: Image registry DataFrame with ``img_id`` and ``path`` columns.
+        img_base_dir: Fallback base directory when ``_base_dir`` column is absent.
+        transform: Image transform to apply (default: IMAGE_TRANSFORM).
+        double_length: If True, duplicate the sample list for augmentation variety.
+    """
+
+    def __init__(
+        self,
+        single_img_df: pd.DataFrame,
+        img_df: pd.DataFrame,
+        img_base_dir: str = "",
+        transform=None,
+        double_length: bool = False,
+    ) -> None:
+        self.transform = transform or IMAGE_TRANSFORM
+
+        has_base_dir_col = "_base_dir" in img_df.columns
+        self.img_lookup: dict[str, tuple[str, str]] = {}
+        for _, row in img_df.iterrows():
+            iid = str(row["img_id"])
+            path = str(row["path"])
+            base = str(row["_base_dir"]) if has_base_dir_col else img_base_dir
+            self.img_lookup[iid] = (path, base)
+
+        # samples: (img_id, label, is_tie)
+        self.samples: list[tuple[str, int, int]] = []
+        tie_count = 0
+
+        for _, row in single_img_df.iterrows():
+            img_id = str(row["img_id"])
+            if img_id not in self.img_lookup:
+                continue
+            label = int(row["label"])
+            is_tie = int(row["is_tie"])
+            if is_tie:
+                tie_count += 1
+            self.samples.append((img_id, label, is_tie))
+
+        print(f"  [SingleImageDataset] {len(self.samples):,} single-image samples "
+              f"({tie_count:,} from tie pairs).")
+
+        if double_length:
+            orig_len = len(self.samples)
+            self.samples = self.samples * 2
+            print(f"  [SingleImageDataset] Doubled length: {orig_len} → {len(self.samples)}.")
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor, int, int]:
+        img_id, label, is_tie = self.samples[idx]
+        path, base = self.img_lookup[img_id]
+        if not os.path.isabs(path):
+            path = os.path.join(base, path) if base else path
+        img = Image.open(path)
+        if img.mode != "RGB":
+            img = img.convert("RGB")
+        tensor = self.transform(img)
+        # Return the same tensor for both A and B slots; the loop uses cat([A,B])
+        # and targets = cat([label, 1-label]) — both logits see the true image,
+        # which is correct for single-image cross-entropy.
+        return tensor, tensor, label, is_tie
+
+
 # ---------------------------------------------------------------------------
 # Evaluation helpers
 # ---------------------------------------------------------------------------
@@ -414,6 +509,28 @@ def _evaluate_epoch(
 
 
 # ---------------------------------------------------------------------------
+# Helper for crossentropy val unique-image scoring
+# ---------------------------------------------------------------------------
+
+def _make_dummy_val_human_df(single_img_df: pd.DataFrame) -> pd.DataFrame:
+    """Build a minimal synthetic human_df so _score_images can collect unique val img_ids.
+
+    In crossentropy / single-image mode the val human_df may not exist (cross-split
+    pairs were split at the image level).  We synthesise a two-column DataFrame with
+    img_id_A and img_id_B both set to each unique img_id so the unique-image
+    collection logic in the training loop still works correctly.
+
+    Args:
+        single_img_df: Output of resolve_pairs_image_level for the val split.
+
+    Returns:
+        DataFrame with ``img_id_A`` and ``img_id_B`` columns (both equal to img_id).
+    """
+    unique_ids = single_img_df["img_id"].astype(str).unique().tolist()
+    return pd.DataFrame({"img_id_A": unique_ids, "img_id_B": unique_ids})
+
+
+# ---------------------------------------------------------------------------
 # Main training function
 # ---------------------------------------------------------------------------
 
@@ -424,6 +541,9 @@ def train(
     model_folder: str,
     val_human_df: pd.DataFrame | None = None,
     val_img_df: pd.DataFrame | None = None,
+    # Single-image DataFrames for crossentropy mode (output of resolve_pairs_image_level)
+    single_img_train_df: pd.DataFrame | None = None,
+    single_img_val_df: pd.DataFrame | None = None,
     from_checkpoint: str | None = None,
     vit_weights: bool = True,
     freeze_vit: bool = False,
@@ -433,21 +553,39 @@ def train(
     num_workers: int = 4,
     device: torch.device | None = None,
     pretrained_model_dir: str = "models/default_models",
-    early_stopping_patience: int = 4,
-    early_stopping_min_delta: float = 0.005,
+    early_stopping_patience: int | None = 4,
+    early_stopping_min_delta: float | None = 0.005,
     # Added hyperparams
     loss_hyperparam: str = "pair",
     accuracy_hyperparam: str = "pair",
+    save_last_epoch: bool = False,
 ) -> str:
     """Fine-tune a perception model on AB-survey data.
 
+    Dataset selection
+    -----------------
+    When ``loss_hyperparam == "crossentropy"`` and ``single_img_train_df`` is
+    provided, the training Dataset is built as a :class:`SingleImageDataset`
+    from the single-image rows.  This correctly includes cross-split pairs (where
+    one image belongs to a different split) because the crossentropy loss is
+    computed per-image independently — there is no leakage risk.
+
+    When ``loss_hyperparam`` is ``"pair"`` or ``"mixed"``, the Dataset is the
+    standard :class:`ABPairDataset` where BOTH images of every pair must belong
+    to the same split (pairs that span the boundary are dropped upstream in
+    :func:`dataset.resolve_pairs_for_val_split`).
+
     Args:
-        human_df: AB-pair human preference judgments for training.
+        human_df: AB-pair human preference judgments for training (pair/mixed mode).
         img_df: Image registry.
         metric: Name of the metric (e.g. "walk").
         model_folder: Directory where models, history, and plots are written.
-        val_human_df: AB-pair human preference judgments for validation.
+        val_human_df: AB-pair human preference judgments for validation (pair/mixed mode).
         val_img_df: Image registry for validation.
+        single_img_train_df: Single-image label rows for crossentropy training.
+            When provided and loss is "crossentropy", takes precedence over human_df.
+        single_img_val_df: Single-image label rows for crossentropy validation.
+            When provided and loss is "crossentropy", takes precedence over val_human_df.
         from_checkpoint: Path or metric name of pretrained model to load.
         vit_weights: Whether to initialize with ImageNet ViT weights.
         freeze_vit: Whether to freeze ViT backbone.
@@ -459,8 +597,15 @@ def train(
         pretrained_model_dir: Base directory for pretrained models.
         early_stopping_patience: Patience for early stopping.
         early_stopping_min_delta: Minimum progress delta for early stopping.
-        loss_hyperparam: Loss function to optimize ("pair" or "crossentropy").
-        accuracy_hyperparam: Accuracy function to monitor and optimize ("pair" or "crossentropy"/"single").
+        loss_hyperparam: Loss function to optimize ("pair", "crossentropy", or "mixed").
+        accuracy_hyperparam: Accuracy function to monitor ("pair" or "crossentropy"/"single").
+        save_last_epoch: If True, always overwrite the checkpoint with the model from the
+            most recent epoch, regardless of whether validation accuracy improved.
+            The best-accuracy checkpoint logic still runs in parallel — the history CSV
+            still records ``checkpoint=True`` only on accuracy improvements — but the
+            .pth file on disk will always reflect the last completed epoch.
+            Useful when you want the freshest weights rather than the most validated ones,
+            e.g. when fine-tuning for a fixed number of epochs on a small dataset.
 
     Returns:
         str: Absolute path to the saved best model.
@@ -470,13 +615,30 @@ def train(
 
     print(f"Training device: {device} | Optimizing Loss: '{loss_hyperparam}' | Monitoring Accuracy: '{accuracy_hyperparam}'")
 
-    train_dataset = ABPairDataset(
-        human_df=human_df,
-        img_df=img_df,
-        transform=TRAIN_IMAGE_TRANSFORM,
-        double_length=True,
+    # ── Decide which dataset class to use ───────────────────────────────────
+    use_single_image_mode = (
+        loss_hyperparam == "crossentropy"
+        and single_img_train_df is not None
+        and len(single_img_train_df) > 0
     )
-    print(f"  Train dataset size: {len(train_dataset):,} pairs")
+
+    if use_single_image_mode:
+        print("  [Dataset mode] crossentropy + single_img_train_df → SingleImageDataset "
+              "(cross-split pairs included via image-level resolution).")
+        train_dataset = SingleImageDataset(
+            single_img_df=single_img_train_df,
+            img_df=img_df,
+            transform=TRAIN_IMAGE_TRANSFORM,
+            double_length=True,
+        )
+    else:
+        train_dataset = ABPairDataset(
+            human_df=human_df,
+            img_df=img_df,
+            transform=TRAIN_IMAGE_TRANSFORM,
+            double_length=True,
+        )
+    print(f"  Train dataset size: {len(train_dataset):,} samples")
 
     train_loader = DataLoader(
         train_dataset,
@@ -485,31 +647,69 @@ def train(
         num_workers=num_workers,
     )
 
-    has_val = val_human_df is not None and len(val_human_df) > 0
+    has_val = False
     val_loader = None
     val_img_lookup: dict = {}
+    effective_val_human_df = val_human_df  # used for unique image scoring in val phase
 
-    if has_val:
+    use_single_image_val = (
+        loss_hyperparam == "crossentropy"
+        and single_img_val_df is not None
+        and len(single_img_val_df) > 0
+    )
+
+    if use_single_image_val:
+        print("  [Val mode] crossentropy + single_img_val_df → SingleImageDataset for validation.")
+        effective_val_img_df = val_img_df if val_img_df is not None else img_df
+        val_dataset = SingleImageDataset(
+            single_img_df=single_img_val_df,
+            img_df=effective_val_img_df,
+            transform=IMAGE_TRANSFORM,
+        )
+        if len(val_dataset) > 0:
+            has_val = True
+            print(f"  Val dataset size: {len(val_dataset):,} samples")
+            val_loader = DataLoader(
+                val_dataset,
+                batch_size=batch_size,
+                shuffle=False,
+                num_workers=num_workers,
+            )
+            has_base_dir_col = "_base_dir" in effective_val_img_df.columns
+            for _, row in effective_val_img_df.iterrows():
+                iid = str(row["img_id"])
+                path = str(row["path"])
+                base = str(row["_base_dir"]) if has_base_dir_col else ""
+                val_img_lookup[iid] = (path, base)
+            # Build a synthetic val_human_df so unique-image scoring still works.
+            # We derive it from single_img_val_df: unique img_ids scored individually.
+            effective_val_human_df = _make_dummy_val_human_df(single_img_val_df)
+        else:
+            print("  No validation samples in SingleImageDataset — skipping validation.")
+    elif val_human_df is not None and len(val_human_df) > 0:
         effective_val_img_df = val_img_df if val_img_df is not None else img_df
         val_dataset = ABPairDataset(
             human_df=val_human_df,
             img_df=effective_val_img_df,
             transform=IMAGE_TRANSFORM,
         )
-        print(f"  Val dataset size: {len(val_dataset):,} pairs")
-        val_loader = DataLoader(
-            val_dataset,
-            batch_size=batch_size,
-            shuffle=False,
-            num_workers=num_workers,
-        )
-        has_base_dir_col = "_base_dir" in effective_val_img_df.columns
-        for _, row in effective_val_img_df.iterrows():
-            iid = str(row["img_id"])
-            path = str(row["path"])
-            base = str(row["_base_dir"]) if has_base_dir_col else ""
-            val_img_lookup[iid] = (path, base)
-    else:
+        if len(val_dataset) > 0:
+            has_val = True
+            print(f"  Val dataset size: {len(val_dataset):,} pairs")
+            val_loader = DataLoader(
+                val_dataset,
+                batch_size=batch_size,
+                shuffle=False,
+                num_workers=num_workers,
+            )
+            has_base_dir_col = "_base_dir" in effective_val_img_df.columns
+            for _, row in effective_val_img_df.iterrows():
+                iid = str(row["img_id"])
+                path = str(row["path"])
+                base = str(row["_base_dir"]) if has_base_dir_col else ""
+                val_img_lookup[iid] = (path, base)
+
+    if not has_val:
         print("  No validation set supplied — skipping validation and early stopping.")
 
     # Model instantiation / checkpoint loading
@@ -610,9 +810,17 @@ def train(
         filter(lambda p: p.requires_grad, model.parameters()),
         lr=lr,
     )
+    # Early stopping is disabled when save_last_epoch=True (saving the final epoch
+    # only makes sense if all epochs run), or when patience/min_delta are None.
+    effective_patience   = None if save_last_epoch else early_stopping_patience
+    effective_min_delta  = None if save_last_epoch else early_stopping_min_delta
+    if save_last_epoch and (early_stopping_patience is not None or early_stopping_min_delta is not None):
+        print("  Early stopping disabled (save_last_epoch=True — all epochs will run).")
+    elif effective_patience is None or effective_min_delta is None:
+        print("  Early stopping disabled (patience or min_delta is None).")
     early_stop = EarlyStopping(
-        patience=early_stopping_patience,
-        min_delta=early_stopping_min_delta,
+        patience=effective_patience,
+        min_delta=effective_min_delta,
     )
     
     history: list[dict] = []
@@ -629,8 +837,8 @@ def train(
             
             # Score validation set unique images
             all_ids = list(
-                set(val_human_df["img_id_A"].astype(str).tolist())
-                | set(val_human_df["img_id_B"].astype(str).tolist())
+                set(effective_val_human_df["img_id_A"].astype(str).tolist())
+                | set(effective_val_human_df["img_id_B"].astype(str).tolist())
             )
             val_scores = _score_images(model, all_ids, val_img_lookup, IMAGE_TRANSFORM, device)
             val_score_mean, val_score_std, val_entropy = _compute_unique_image_stats(val_scores)
@@ -735,8 +943,8 @@ def train(
             
             # Score unique images
             all_ids = list(
-                set(val_human_df["img_id_A"].astype(str).tolist())
-                | set(val_human_df["img_id_B"].astype(str).tolist())
+                set(effective_val_human_df["img_id_A"].astype(str).tolist())
+                | set(effective_val_human_df["img_id_B"].astype(str).tolist())
             )
             val_scores = _score_images(model, all_ids, val_img_lookup, IMAGE_TRANSFORM, device)
             val_score_mean, val_score_std, val_entropy = _compute_unique_image_stats(val_scores)
@@ -767,6 +975,10 @@ def train(
                 torch.save(core, save_path)
                 print(f"  ✓ Checkpoint saved (val_acc={val_acc:.4f} improved over best {best_accuracy:.4f})")
                 is_saved = True
+            elif save_last_epoch:
+                core = model.module if isinstance(model, nn.DataParallel) else model
+                torch.save(core, save_path)
+                print(f"  ✓ Last-epoch checkpoint saved (val_acc={val_acc:.4f} <= best {best_accuracy:.4f}, save_last_epoch=True)")
             else:
                 print(f"  ✗ Not saving (val_acc={val_acc:.4f} <= best {best_accuracy:.4f})")
         else:
