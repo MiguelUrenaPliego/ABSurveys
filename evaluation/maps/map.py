@@ -50,6 +50,7 @@ def generate_custom_html_map(
         zoom_start=17,
         tiles=None,
         control_scale=True,
+        maxZoom=24  # Set maximum zoom on the map to 24
     )
     
     # Add Google Hybrid Tile Layer
@@ -58,6 +59,8 @@ def generate_custom_html_map(
         attr="Google Hybrid Map",
         name="Google Hybrid",
         opacity=0.65,
+        max_zoom=24,         # <--- Let Leaflet zoom the layer up to level 24
+        max_native_zoom=21,  # <--- Stop requesting new tiles at 21, stretching them instead
     ).add_to(m)
 
     # Convert our points_data to a clean JSON string for embedding
